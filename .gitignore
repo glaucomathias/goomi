@@ -1,0 +1,11 @@
+# bancos locais
+goomi.db
+backend/goomi.db
+
+# ambientes virtuais e caches
+**/.venv/
+**/__pycache__/
+**/.streamlit/
+
+# variáveis locais
+.env

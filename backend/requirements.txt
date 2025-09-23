@@ -1,0 +1,9 @@
+# requirements_backend_v19.txt — baseado no goomi_app_v19.py
+flask>=3.0
+pyyaml>=6.0
+requests>=2.31
+openai>=1.40
+langchain>=0.3
+langchain-openai>=0.3
+tiktoken>=0.7.0
+tzdata>=2024.1

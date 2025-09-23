@@ -1,0 +1,27 @@
+project:
+  name: "GOOMI"
+  db_path: "goomi.db"            # banco do GOOMI
+  timezone: "America/Sao_Paulo"
+
+api_key:
+  key: ""                        # deixe vazio (vamos usar variável de ambiente)
+
+model:
+  name: "gpt-4o-mini"            # pode trocar por "gpt-4o" se quiser
+  temperature: 0
+  max_tokens: 2048
+
+memory:
+  per_user: true                 # memória individual por integrante
+
+features:
+  rag_enabled: false             # por enquanto sem leitura de documentos
+  web_search: true              # busca na web ATIVADA
+
+parents_panel:
+  enabled: true                  # espaço pra recursos de responsáveis (futuro)
+
+sports:
+  enabled: true
+  provider: "api-football"
+  api_key: ""                  # deixe vazio (vamos usar variável de ambiente)
