@@ -3,10 +3,11 @@ import uuid
 import base64
 import json
 import re
+import hashlib
 from collections import Counter
 import requests
 import streamlit as st
-from datetime import datetime, date  # >>> já presente
+from datetime import datetime, date
 
 # =========================
 # Page config
@@ -27,7 +28,7 @@ HEALTH_URL = f"{API_BASE}/health"
 
 APP_NAME   = "Goomih"
 SUBTITLE   = "Assistente virtual da nossa família"
-HERO_WIDTH = 120  # logo um pouco menor para não forçar rolagem
+HERO_WIDTH = 120
 
 USERS = {
     "giulia":    {"label": "Giulia",    "avatar": "😊", "color": "pink"},
@@ -90,7 +91,6 @@ def _save_quick_stats(stats: dict) -> None:
         pass
 
 def _top4_for(user: str) -> list[str]:
-    """Retorna top-4 perguntas do usuário, caindo para as sementes se não houver histórico."""
     stats = _load_quick_stats()
     user_counts = Counter(stats.get(user, {}))
     if not user_counts:
@@ -118,7 +118,7 @@ def init_state():
     ss.setdefault("logged_in", False)
     ss.setdefault("client_id", None)
     ss.setdefault("session_id", str(uuid.uuid4()))
-    ss.setdefault("show_user_switcher", False)
+    ss.setdefault("show_user_switcher", False)  # legado; não exibimos mais
     ss.setdefault("chats", {})
     ss.setdefault("current_chat_id", None)
 
@@ -130,7 +130,7 @@ def init_state():
 init_state()
 
 # =========================
-# Estilos (centralização real + login estreito)
+# Estilos
 # =========================
 st.markdown(f"""
 <style>
@@ -142,7 +142,6 @@ st.markdown(f"""
   --ok: #22C55E;
   --bad:#EF4444;
   --content-max: 900px;
-  --content-narrow: 420px;
 }}
 
 .stApp {{
@@ -152,11 +151,8 @@ st.markdown(f"""
 
 .block-container {{ padding-top: 1.2rem; }}
 
-/* containers centrais */
 .center-wrap {{ max-width: var(--content-max); margin: 0 auto; }}
-.narrow-wrap {{ max-width: var(--content-narrow); margin: 0 auto; }}
 
-/* HERO */
 .hero-wrap {{ max-width: var(--content-max); margin: 0 auto; text-align: center; }}
 .hero-title {{ font-size: 40px; margin: 0 0 .25rem 0; }}
 .hero-sub   {{ font-size: 20px; font-weight: 600; color: var(--sub); margin: 0; }}
@@ -167,7 +163,6 @@ st.markdown(f"""
   display: inline-block !important;
 }}
 
-/* Card de status */
 .pill {{
   display:inline-block; padding:6px 10px; border-radius:999px;
   background: var(--card); color: var(--fg);
@@ -177,7 +172,6 @@ st.markdown(f"""
 .pill.ok {{ background: rgba(34,197,94,0.15); color: var(--ok); }}
 .pill.bad{{ background: rgba(239,68,68,0.15); color: var(--bad); }}
 
-/* Banner */
 .shadow-card {{
   background: var(--card);
   border: 1px solid rgba(0,0,0,0.06);
@@ -187,21 +181,49 @@ st.markdown(f"""
   text-align:center;
 }}
 
-/* Sidebar compacta */
 [data-testid="stSidebar"] * {{ font-size: 14px !important; }}
-[data-testid="stSidebar"] .stButton button {{
-  font-size: 12px !important; padding: 6px 10px !important; white-space: nowrap;
+
+.stButton > button, button[kind],
+a[data-testid="baseLinkButton-primary"], a[data-testid="baseLinkButton-secondary"] {{
+  background-color: #ffffff !important;
+  color: #0f172a !important;
+  border: 1px solid #e5e7eb !important;
+  box-shadow: 0 1px 2px rgba(0,0,0,.04) !important;
+  border-radius: 12px !important;
+}}
+.stButton > button:hover,
+button[kind]:hover,
+a[data-testid="baseLinkButton-primary"]:hover,
+a[data-testid="baseLinkButton-secondary"]:hover {{
+  background-color: #f8fafc !important;
+  border-color: #dbe1ea !important;
+}}
+.stButton > button:active,
+button[kind]:active {{ background-color: #f1f5f9 !important; }}
+
+.stTextInput input, .stTextArea textarea {{
+  background: #ffffff !important;
+  color: #0f172a !important;
+  border: 1px solid #e5e7eb !important;
+  border-radius: 10px !important;
+}}
+div[role="combobox"] {{
+  background: #ffffff !important;
+  border: 1px solid #e5e7eb !important;
+  border-radius: 10px !important;
 }}
 
-/* Quick prompts menores */
-.quickbar button {{
-  margin: 4px; border-radius: 999px;
-  font-size: 12px !important; padding: 6px 10px !important;
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-}}
+[data-testid="stChatInput"] {{ background: #ffffff !important; }}
 
-/* Garantir que o primeiro título da página (topo) fique centralizado */
-.block-container h1:first-of-type {{ text-align: center; }}
+@media (prefers-color-scheme: dark) {{
+  .stButton > button, button[kind],
+  a[data-testid="baseLinkButton-primary"], a[data-testid="baseLinkButton-secondary"],
+  .stTextInput input, .stTextArea textarea, div[role="combobox"],
+  [data-testid="stChatInput"] {{
+    background: #ffffff !important;
+    color: #0f172a !important;
+  }}
+}}
 </style>
 """, unsafe_allow_html=True)
 
@@ -234,7 +256,6 @@ def avatar_for(user_key: str) -> str:
     return USERS.get(user_key, USERS["glauco"])["avatar"]
 
 def _img_b64(path: str) -> str:
-    """Retorna tag <img> base64 (centra sem depender de st.image)."""
     if not os.path.exists(path):
         return ""
     with open(path, "rb") as f:
@@ -242,7 +263,6 @@ def _img_b64(path: str) -> str:
     return f"<img src='data:image/png;base64,{b64}' alt='logo'/>"
 
 def render_hero():
-    """Título, subtítulo e logo — alinhados ao mesmo eixo do conteúdo central."""
     st.markdown(
         f"<div class='hero-wrap'>"
         f"<h1 class='hero-title'>{APP_NAME}</h1>"
@@ -270,9 +290,6 @@ def _normalize_subject(name: str) -> str:
     return mapping.get(n, n.title())
 
 def _parse_grades_text(raw: str):
-    """
-    Converte bullets + 'Médias por período' em estrutura.
-    """
     data = {}
 
     def ensure(subj):
@@ -414,10 +431,6 @@ def _try_render_projections(raw: str) -> str | None:
     return _mk_table_html(headers, rows)
 
 def try_render_football_pretty(raw: str) -> bool:
-    """
-    Renderiza tabela para jogos ou projeções, se qualquer parser conseguir extrair dados.
-    Remove o gating por 'hint' para cobrir casos com 'x' (projeções) além de 'vs'.
-    """
     html = _try_render_fixtures(raw)
     if not html:
         html = _try_render_projections(raw)
@@ -443,50 +456,37 @@ def _fmt_br(d: date | None) -> str:
     return d.strftime("%d/%m/%Y") if d else "-"
 
 def _format_consulta_line(line: str) -> str | None:
-    """
-    Aceita os dois formatos do backend:
-      A) "#3 - Consulta (Dermatologia) | realizado: 2025-09-20 | retorno: 2025-10-01"
-      B) "#24 — Consulta (Odontologia; Dra. Gabriela Dia) | Agendado: 23/10/2025"
-    - Suporta "-" e "—" após o ID.
-    - Suporta rótulos em minúsculas/maiúsculas: realizado/agendado/retorno.
-    - Suporta datas em YYYY-MM-DD e DD/MM/YYYY.
-    """
     line = line.strip()
     if not line.startswith("#"):
         return None
 
-    # ID e Título (tipo + (extras))
     m_head = re.match(r"#(?P<id>\d+)\s*[—-]\s*(?P<tipo>[A-Za-zÀ-ÿ]+)\s*(\((?P<extras>[^)]+)\))?", line)
     if not m_head:
         return None
     rid   = m_head.group("id")
     tipo  = (m_head.group("tipo") or "Consulta").capitalize()
-    extra = m_head.group("extras")  # pode conter "Dermatologia" ou "Odontologia; Dra. ..."
+    extra = m_head.group("extras")
 
-    # Datas (qualquer ordem), capturando rótulo + data nos dois formatos
     labels = []
     for lab, dt in re.findall(r"(?i)\b(agendado|realizado|retorno)\s*:\s*([0-9]{4}-[0-9]{2}-[0-9]{2}|[0-9]{2}/[0-9]{2}/[0-9]{4})", line):
         labels.append( (lab.lower(), dt) )
 
-    # Normaliza para DD/MM/AAAA
     def to_br(d):
         if re.match(r"^\d{4}-\d{2}-\d{2}$", d):
             y, m, dd = d.split("-"); return f"{dd}/{m}/{y}"
-        return d  # já está em BR
+        return d
 
     parts = [f"#{rid} — {tipo}"]
     if extra:
         parts[0] += f" ({extra})"
 
     shown_any = False
-    # Prioriza ordem: Agendado/Realizado, depois Retorno, mantendo o que vier do backend
     for key in ["agendado", "realizado", "retorno"]:
         for lab, d in labels:
             if lab == key:
                 parts.append(f"{lab.capitalize()}: {to_br(d)}")
                 shown_any = True
 
-    # Fallback: se não veio label explícito mas veio uma data de realização no formato antigo
     if not shown_any:
         m_real_old = re.search(r"(?i)\brealizado\s*:\s*([0-9]{4}-[0-9]{2}-[0-9]{2})", line)
         m_ret_old  = re.search(r"(?i)\bretorno\s*:\s*([0-9]{4}-[0-9]{2}-[0-9]{2})", line)
@@ -498,6 +498,7 @@ def _format_consulta_line(line: str) -> str | None:
             shown_any = True
 
     return " | ".join(parts) if parts else None
+
 def render_health_if_possible(raw: str) -> bool:
     triggers = ["Próximo compromisso", "Próximo retorno", "Último compromisso", "Últimos registros",
                 "Proximo compromisso", "Proximo retorno", "Ultimo compromisso", "Ultimos registros"]
@@ -530,29 +531,44 @@ def render_health_if_possible(raw: str) -> bool:
         unsafe_allow_html=True,
     )
     return True
-# ---------- FIM (Consultas Médicas) ----------
 
 # =========================
-# Login (estreito e centralizado)
+# LOGIN (centralizado e mais estreito via colunas; senha abaixo; botão largura dos inputs)
 # =========================
+USERS_PASS_SHA256 = {
+    "giulia":    "d0a28ee5acfcd6f70942dfc57a71418469062a92b380036e5f1b53848bc6e0c2",
+    "giovanna":  "bf14dbb338eeb960b694a01b3d66d4a13f9c4c5b12a2a43f15b628811957524d",
+    "guilherme": "0a9ad7b5557b663db0dcde8160043f5a7873c441aef3da4037690992dfeb4b31",
+    "glauco":    "e4d8e2c97976e3e0ddeae407fd54987f0b4f8d6792284742b51399a078765319",
+    "helena":    "4b9a7f50c0bb198c6f5414c5a8459f5d216d34ab521ea94c060ea35cac66f900",
+}
+
+def _sha256_hex(s: str) -> str:
+    return hashlib.sha256(s.encode()).hexdigest()
+
 if not st.session_state.logged_in:
     render_hero()
     st.write("")
-    st.markdown("<div class='narrow-wrap'>", unsafe_allow_html=True)
     st.markdown("<h3 style='text-align:center;'>Escolha quem vai conversar</h3>", unsafe_allow_html=True)
-    c1, c2, c3 = st.columns([3,2,3])
-    with c2:
+
+    left, mid, right = st.columns([1, 1.25, 1])  # ~33% da largura total
+    with mid:
         who = st.selectbox("Usuário", list(USERS.keys()), format_func=lambda k: USERS[k]["label"])
+        pwd = st.text_input("Senha", type="password")
         if st.button("Entrar", use_container_width=True):
-            st.session_state.client_id = who
-            st.session_state.logged_in = True
-            st.rerun()
-    st.markdown("</div>", unsafe_allow_html=True)
+            if who not in USERS_PASS_SHA256:
+                st.error("Usuário inválido.")
+            elif _sha256_hex(pwd) != USERS_PASS_SHA256[who]:
+                st.error("Senha incorreta. Tente novamente.")
+            else:
+                st.session_state.client_id = who
+                st.session_state.logged_in = True
+                st.rerun()
+
     st.stop()
 
 # =========================
-# Sidebar — controles
-# (AGORA USANDO APENAS O BOTÃO PADRÃO DE EXPANDIR/RECOLHER DO STREAMLIT)
+# Sidebar — controles (sem troca de usuário)
 # =========================
 with st.sidebar:
     api_ok = api_health_ok()
@@ -560,27 +576,6 @@ with st.sidebar:
         f"<span class='pill {'ok' if api_ok else 'bad'}'>● API {'online' if api_ok else 'offline'}</span>",
         unsafe_allow_html=True
     )
-
-    if st.button("👤 Trocar usuário", use_container_width=True):
-        st.session_state.show_user_switcher = not st.session_state.show_user_switcher
-    if st.session_state.show_user_switcher:
-        who = st.selectbox(
-            "Selecione o usuário",
-            list(USERS.keys()),
-            index=list(USERS.keys()).index(st.session_state.client_id),
-            format_func=lambda k: USERS[k]["label"]
-        )
-        c1, c2 = st.columns(2)
-        if c1.button("Confirmar"):
-            st.session_state.client_id = who
-            st.session_state.show_user_switcher = False
-            new_cid = str(uuid.uuid4())
-            st.session_state.chats = {new_cid: {"name": "Bem-vindo 👋", "messages": []}}
-            st.session_state.current_chat_id = new_cid
-            st.session_state.session_id = str(uuid.uuid4())
-            st.rerun()
-        if c2.button("Cancelar"):
-            st.session_state.show_user_switcher = False
 
     if st.button("➕ Novo chat", use_container_width=True):
         cid = str(uuid.uuid4())
@@ -622,7 +617,7 @@ with st.sidebar:
             st.error(f"Falha: {e}")
 
 # =========================
-# Header central
+# Header central (mantém como v8)
 # =========================
 render_hero()
 st.markdown(
@@ -671,16 +666,13 @@ for msg in chat["messages"]:
     with st.chat_message(who, avatar=avatar):
         content = msg["content"]
         if who == "assistant":
-            # 1) consultas médicas primeiro
             if render_health_if_possible(content):
                 continue
-            # 2) notas
             tbl = render_grades_table_if_possible(content)
             if tbl:
                 st.markdown("**Aqui estão suas notas organizadas:**")
                 st.markdown(tbl)
             else:
-                # 3) futebol (jogos/projeções)
                 if not try_render_football_pretty(content):
                     st.markdown(content)
         else:
@@ -703,15 +695,12 @@ if prompt:
 
     chat["messages"].append({"role": "assistant", "content": answer})
     with st.chat_message("assistant", avatar="🤖"):
-        # 1) consultas médicas primeiro
         if not render_health_if_possible(answer):
-            # 2) notas
             tbl = render_grades_table_if_possible(answer)
             if tbl:
                 st.markdown("**Aqui estão suas notas organizadas:**")
                 st.markdown(tbl)
             else:
-                # 3) futebol (jogos/projeções)
                 if not try_render_football_pretty(answer):
                     st.markdown(answer)
 
