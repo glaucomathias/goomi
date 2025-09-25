@@ -22,13 +22,15 @@ st.set_page_config(page_title=PAGE_TITLE, page_icon=PAGE_ICON, layout="wide")
 # =========================
 # Configs básicas
 # =========================
+# Padrão QA: 127.0.0.1:5000. Em produção, GOOMI_API_BASE é definido via /etc/goomi.env
 API_BASE   = os.getenv("GOOMI_API_BASE", "http://127.0.0.1:5000")
 ASK_URL    = f"{API_BASE}/ask"
 HEALTH_URL = f"{API_BASE}/health"
 
 APP_NAME   = "Goomih"
 SUBTITLE   = "Assistente virtual da nossa família"
-HERO_WIDTH = 120
+HERO_WIDTH = 120  # logo
+CONTENT_MAX = 900
 
 USERS = {
     "giulia":    {"label": "Giulia",    "avatar": "😊", "color": "pink"},
@@ -118,7 +120,6 @@ def init_state():
     ss.setdefault("logged_in", False)
     ss.setdefault("client_id", None)
     ss.setdefault("session_id", str(uuid.uuid4()))
-    ss.setdefault("show_user_switcher", False)  # legado; não exibimos mais
     ss.setdefault("chats", {})
     ss.setdefault("current_chat_id", None)
 
@@ -141,27 +142,18 @@ st.markdown(f"""
   --card: #F3F4F6;
   --ok: #22C55E;
   --bad:#EF4444;
-  --content-max: 900px;
+  --content-max: {CONTENT_MAX}px;
 }}
 
-.stApp {{
-  background: var(--bg) !important;
-  color: var(--fg) !important;
-}}
-
+.stApp {{ background: var(--bg) !important; color: var(--fg) !important; }}
 .block-container {{ padding-top: 1.2rem; }}
-
 .center-wrap {{ max-width: var(--content-max); margin: 0 auto; }}
 
 .hero-wrap {{ max-width: var(--content-max); margin: 0 auto; text-align: center; }}
 .hero-title {{ font-size: 40px; margin: 0 0 .25rem 0; }}
 .hero-sub   {{ font-size: 20px; font-weight: 600; color: var(--sub); margin: 0; }}
 .hero-logo  {{ margin-top: 8px; }}
-.hero-logo img {{
-  width: {HERO_WIDTH}px !important;
-  max-width: {HERO_WIDTH}px !important;
-  display: inline-block !important;
-}}
+.hero-logo img {{ width: {HERO_WIDTH}px !important; max-width: {HERO_WIDTH}px !important; display: inline-block !important; }}
 
 .pill {{
   display:inline-block; padding:6px 10px; border-radius:999px;
@@ -445,6 +437,73 @@ def try_render_football_pretty(raw: str) -> bool:
     )
     return True
 
+# ---------- Formatação genérica para respostas "cruas" do Goomih ----------
+def _looks_markdownish(txt: str) -> bool:
+    """Heurística simples para não retrabalhar textos já em Markdown rico (ex.: OpenAI)."""
+    if any(h in txt for h in ["\n- ", "\n* ", "\n1. ", "```", "__", "**", "# "]):
+        return True
+    if re.search(r"\[[^\]]+\]\([^)]+\)", txt):
+        return True
+    return False
+
+def _normalize_bullets(txt: str) -> str:
+    """Converte bullets '•' ou '-' em lista markdown; quebra ' • ' inline em nova linha."""
+    txt = re.sub(r"\s+•\s+", "\n• ", txt)
+    txt = re.sub(r"([^\n])\s*•\s+", r"\1\n• ", txt)
+    lines = []
+    for raw in txt.splitlines():
+        s = raw.strip()
+        if s.startswith("•"):
+            s = s.lstrip("•").strip()
+            lines.append(f"- {s}")
+        elif re.match(r"^[-–—]\s+\S", s):
+            s = re.sub(r"^[-–—]\s+", "", s)
+            lines.append(f"- {s}")
+        else:
+            lines.append(s)
+    out = "\n".join(lines)
+    out = re.sub(r"\n{3,}", "\n\n", out).strip()
+    return out
+
+def _bold_labels(txt: str) -> str:
+    """Destaca 'Titulo: valor' como **Titulo:** valor."""
+    def repl(m):
+        label = m.group(1).strip()
+        value = m.group(2).strip()
+        return f"**{label}:** {value}"
+    pattern = re.compile(r"(?m)^\s*([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ\s]+?):\s*(.+)$")
+    return pattern.sub(repl, txt)
+
+def format_goomi_plaintext(raw: str) -> str | None:
+    """
+    Deixa bonito textos do 'Manual — ...' e outras respostas cruas do Goomih.
+    Não mexe em respostas que já parecem Markdown.
+    """
+    if not raw or _looks_markdownish(raw):
+        return None
+
+    txt = raw.strip()
+
+    manual_m = re.match(r"(?s)^\s*(Manual\s+—\s+[^\n]+)\s*\n+(.*)$", txt)
+    if manual_m:
+        title = manual_m.group(1).strip()
+        body  = manual_m.group(2).strip()
+        body  = _normalize_bullets(body)
+        body  = _bold_labels(body)
+        md = f"### {title}\n\n{body}"
+        return md
+
+    if "•" in txt or re.search(r"(?m)^\s*[-–—]\s+\S", txt):
+        body = _normalize_bullets(txt)
+        body = _bold_labels(body)
+        return body
+
+    labels = _bold_labels(txt)
+    if labels != txt:
+        return labels
+
+    return None
+
 # ---------- Consultas Médicas (Helena) – formatação no front ----------
 def _parse_iso(dtxt: str) -> date | None:
     try:
@@ -533,7 +592,7 @@ def render_health_if_possible(raw: str) -> bool:
     return True
 
 # =========================
-# LOGIN (centralizado e mais estreito via colunas; senha abaixo; botão largura dos inputs)
+# LOGIN COM SENHA POR USUÁRIO
 # =========================
 USERS_PASS_SHA256 = {
     "giulia":    "d0a28ee5acfcd6f70942dfc57a71418469062a92b380036e5f1b53848bc6e0c2",
@@ -546,12 +605,13 @@ USERS_PASS_SHA256 = {
 def _sha256_hex(s: str) -> str:
     return hashlib.sha256(s.encode()).hexdigest()
 
+# Login (centralizado estreito; senha abaixo; botão largura dos inputs)
 if not st.session_state.logged_in:
     render_hero()
     st.write("")
     st.markdown("<h3 style='text-align:center;'>Escolha quem vai conversar</h3>", unsafe_allow_html=True)
 
-    left, mid, right = st.columns([1, 1.25, 1])  # ~33% da largura total
+    left, mid, right = st.columns([1, 1.25, 1])  # ~33% da largura
     with mid:
         who = st.selectbox("Usuário", list(USERS.keys()), format_func=lambda k: USERS[k]["label"])
         pwd = st.text_input("Senha", type="password")
@@ -568,7 +628,7 @@ if not st.session_state.logged_in:
     st.stop()
 
 # =========================
-# Sidebar — controles (sem troca de usuário)
+# Sidebar — sem troca de usuário
 # =========================
 with st.sidebar:
     api_ok = api_health_ok()
@@ -666,15 +726,23 @@ for msg in chat["messages"]:
     with st.chat_message(who, avatar=avatar):
         content = msg["content"]
         if who == "assistant":
+            # 1) consultas médicas primeiro
             if render_health_if_possible(content):
                 continue
+            # 2) notas
             tbl = render_grades_table_if_possible(content)
             if tbl:
                 st.markdown("**Aqui estão suas notas organizadas:**")
                 st.markdown(tbl)
             else:
+                # 3) futebol (jogos/projeções)
                 if not try_render_football_pretty(content):
-                    st.markdown(content)
+                    # 4) formatação genérica para respostas cruas
+                    md = format_goomi_plaintext(content)
+                    if md:
+                        st.markdown(md)
+                    else:
+                        st.markdown(content)
         else:
             st.markdown(content)
 
@@ -695,14 +763,22 @@ if prompt:
 
     chat["messages"].append({"role": "assistant", "content": answer})
     with st.chat_message("assistant", avatar="🤖"):
+        # 1) consultas médicas primeiro
         if not render_health_if_possible(answer):
+            # 2) notas
             tbl = render_grades_table_if_possible(answer)
             if tbl:
                 st.markdown("**Aqui estão suas notas organizadas:**")
                 st.markdown(tbl)
             else:
+                # 3) futebol (jogos/projeções)
                 if not try_render_football_pretty(answer):
-                    st.markdown(answer)
+                    # 4) formatação genérica para respostas cruas
+                    md = format_goomi_plaintext(answer)
+                    if md:
+                        st.markdown(md)
+                    else:
+                        st.markdown(answer)
 
     _bump_quick_usage(st.session_state.client_id, prompt)
     st.rerun()
