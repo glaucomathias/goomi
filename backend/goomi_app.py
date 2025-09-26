@@ -108,6 +108,81 @@ def _cache_set(key: str, data: Any):
     _cache[key] = {"ts": time.time(), "data": data}
 
 
+
+# ==== 2B) Horóscopo (fonte externa sem chave) ===============================
+_PT_TO_EN_SIGNS = {
+    "aries": "aries", "áries": "aries",
+    "touro": "taurus", "touros": "taurus",
+    "gemeos": "gemini", "gêmeos": "gemini",
+    "cancer": "cancer", "câncer": "cancer",
+    "leao": "leo", "leão": "leo",
+    "virgem": "virgo", "virgems": "virgo",
+    "libra": "libra",
+    "escorpiao": "scorpio", "escorpião": "scorpio",
+    "sagitario": "sagittarius", "sagitário": "sagittarius",
+    "capricornio": "capricorn", "capricórnio": "capricorn",
+    "aquario": "aquarius", "aquário": "aquarius",
+    "peixes": "pisces", "peixe": "pisces",
+}
+
+def _sign_pt_to_en(sign_pt: str|None) -> str|None:
+    if not sign_pt:
+        return None
+    key = (sign_pt or "").strip().lower()
+    return _PT_TO_EN_SIGNS.get(key)
+
+def _extract_sign_from_text_pt(q: str) -> str|None:
+    ql = (q or "").lower()
+    m = re.search(r"hor[oó]scopo(?:\s+do|\s+da|\s+de)?\s+([a-zçãâáéêíóôõúü]+)", ql, flags=re.IGNORECASE)
+    if m:
+        cand = m.group(1).strip()
+        cand = re.sub(r"^(de|do|da)\s+", "", cand)
+        cand = re.sub(r"(de|do|da|de hoje|de amanh[aã]|hoje|amanh[aã])$", "", cand).strip()
+        en = _sign_pt_to_en(cand)
+        if en:
+            return en
+    for pt in sorted(_PT_TO_EN_SIGNS.keys(), key=len, reverse=True):
+        if re.search(rf"\b{re.escape(pt)}\b", ql):
+            return _PT_TO_EN_SIGNS[pt]
+    return None
+
+def fetch_horoscope(sign_en: str) -> dict|None:
+    try:
+        import requests
+        r = requests.get(f"https://ohmanda.com/api/horoscope/{sign_en}", timeout=6, headers={"User-Agent":"goomi/1.0"})
+        if r.status_code == 200:
+            data = r.json()
+            text = (data.get("horoscope") or "").strip()
+            date_str = data.get("date")
+            if text:
+                return {"date": date_str, "sign": sign_en, "text": text}
+    except Exception:
+        pass
+    try:
+        import requests
+        r = requests.post("https://aztro.sameerkumar.website/", params={"sign": sign_en, "day":"today"}, timeout=6, headers={"User-Agent":"goomi/1.0"})
+        if r.status_code == 200:
+            data = r.json()
+            text = (data.get("description") or "").strip()
+            date_str = data.get("current_date")
+            if text:
+                return {"date": date_str, "sign": sign_en, "text": text}
+    except Exception:
+        pass
+    return None
+
+def format_horoscope_pt(sign_pt: str, payload: dict, chat_model) -> str:
+    raw = payload.get("text","")
+    date_str = payload.get("date") or datetime.date.today().strftime("%Y-%m-%d")
+    from langchain_core.messages import SystemMessage, HumanMessage
+    sys = SystemMessage(content="Você é um assistente que reescreve textos de horóscopo para PT-BR, em 3–5 frases, claro e sem inventar fatos.")
+    hum = HumanMessage(content=f"Reescreva para PT-BR, cite o signo {sign_pt} e a data {date_str}. Texto fonte:\n\n{raw}")
+    try:
+        out = chat_model.invoke([sys, hum]).content.strip()
+        return out
+    except Exception:
+        return f"Horóscopo de {sign_pt} — {date_str}:\n{raw}"
+
 # ==== 3) Flask ===============================================================
 app = Flask(__name__)
 user_memories: Dict[str, ConversationBufferMemory] = {}  # memória RAM por usuário
@@ -434,18 +509,182 @@ def extrair_comando_salvar(question: str, client_id_padrao: str) -> Dict[str, An
     }
 
 
+
 # ==== 7) Perfis (apenas quando perguntarem) =================================
 USER_PROFILES = {
     "giulia": {
         "nome": "Giulia",
-        "idade": 9,
-        "descricao": (
-            "Oi, eu sou a Giulia! Tenho 9 anos, adoro ver vídeos engraçados, viajar e inventar brincadeiras "
-            "com as minhas amigas. Torço pro Flamengo, curto um pagodinho e amo conversar sobre qualquer coisa — "
-            "vale futebol, histórias, curiosidades… o que você quiser!"
-        ),
+        "idade": 10,
+        "data_nascimento": "2015-09-19",
+        "signo": "Virgem",
+        "descricao": "A Giulia é a caçula elétrica e curiosa da casa. Tem 10 anos, virginiana, ama inventar brincadeiras, viajar e brincar com as amigas. Flamenguista, adora pagode, piadas e sorvete de flocos.",
+        "hobbies": ["brincar", "viajar", "jogar com amigas", "ver vídeos", "inventar brincadeiras"],
+        "gostos": ["Flamengo", "pagode", "piadas", "sorvete de flocos"],
+        "nao_gosta": ["tarefas longas sem pausa", "explicações muito formais"],
+        "musica": ["pagode"],
+        "esportes_times": ["Flamengo"],
+        "series_animes": ["the chosen"],
+        "comidas_bebidas": ["sorvete de flocos", "lasanha"],
+        "rotina": {"melhor_horario_interacao": "tarde/início da noite", "estilo_aprendizado": "lúdico, perguntas e respostas, jogos rápidos"},
+        "gatilhos_motivacionais": ["desafios curtos", "missões com recompensa", "elogio divertido"],
+        "tom_preferido": "alegre, brincalhão, com emojis pontuais"
     },
+    "giovanna": {
+        "nome": "Giovanna",
+        "idade": 17,
+        "data_nascimento": "2008-05-19",
+        "signo": "Touro",
+        "descricao": "A Giovanna é social e comunicativa. Tem 17 anos, taurina, ama conversar com amigos, ver vídeos e ouvir música. Flamenguista; curte funk, pagode e trap. Série favorita: The Vampire Diaries. Ama açaí.",
+        "hobbies": ["conversar com amigos", "ver vídeos", "assistir séries"],
+        "gostos": ["Flamengo", "funk", "pagode", "trap", "The Vampire Diaries", "açaí"],
+        "nao_gosta": ["cobranças vagas", "planos sem passo a passo"],
+        "musica": ["funk", "pagode", "trap"],
+        "esportes_times": ["Flamengo"],
+        "series_animes": ["The Vampire Diaries"],
+        "comidas_bebidas": ["açaí"],
+        "rotina": {"melhor_horario_interacao": "tarde/noite", "estilo_aprendizado": "checklists curtos e práticos"},
+        "gatilhos_motivacionais": ["pequenas metas com prazo", "reforço positivo", "mostrar impacto no futuro"],
+        "tom_preferido": "amigável e direto, com exemplos rápidos"
+    },
+    "guilherme": {
+        "nome": "Guilherme",
+        "idade": 12,
+        "data_nascimento": "2012-12-20",
+        "signo": "Sagitário",
+        "descricao": "O Guilherme é gamer e fã de animes. Tem 12 anos, sagitariano, ama jogar com os amigos. Curte vídeos e sorvete de ovomaltine.",
+        "hobbies": ["jogar videogame", "assistir animes", "ver vídeos"],
+        "gostos": ["Demon Slayer", "Jujutsu Kaisen", "sorvete de ovomaltine"],
+        "nao_gosta": ["explicações longas sem exemplo", "tarefas sem 'objetivo'"],
+        "musica": ["internacional"],
+        "esportes_times": ["flamengo"],
+        "series_animes": ["Demon Slayer", "Jujutsu Kaisen"],
+        "comidas_bebidas": ["sorvete de ovomaltine","miojo"],
+        "rotina": {"melhor_horario_interacao": "fim de tarde/noite", "estilo_aprendizado": "gamificação (fases, pontos, conquistas)"},
+        "gatilhos_motivacionais": ["ranking", "XP", "missões diárias"],
+        "tom_preferido": "empolgado e objetivo"
+    },
+    "helena": {
+        "nome": "Helena",
+        "idade": 33,
+        "data_nascimento": "1992-03-18",
+        "signo": "Peixes",
+        "descricao": "A Helena é a mãezona forte e responsável. Tem 33 anos, pisciana. Ama viajar, falar inglês, praia e sol; fã de café e chocolate.",
+        "hobbies": ["viajar", "passear ao ar livre", "praia"],
+        "gostos": ["inglês", "praia", "sol", "chocolate", "café"],
+        "nao_gosta": ["incertezas sem plano B", "prazos difusos"],
+        "musica": ["internacional"],
+        "esportes_times": ["flamengo"],
+        "series_animes": [],
+        "comidas_bebidas": ["chocolate", "café"],
+        "rotina": {"melhor_horario_interacao": "manhã (com café) ou tarde", "estilo_aprendizado": "planos claros com próximos passos"},
+        "gatilhos_motivacionais": ["roadmap simples", "check-ins curtos", "mostrar progresso"],
+        "tom_preferido": "calmo, encorajador e pragmático"
+    },
+    "glauco": {
+        "nome": "Glauco",
+        "idade": 37,
+        "data_nascimento": "1987-12-30",
+        "signo": "Capricórnio",
+        "descricao": "O Glauco é o pai da família (e do Goomih 😄). 37 anos, capricorniano, caseiro; fã de cinema, séries, animes e viagens. Flamenguista, curte NBA e aprender/criar coisas novas.",
+        "hobbies": ["assistir séries", "ver animes", "viajar", "cinema", "criar projetos"],
+        "gostos": ["Flamengo", "NBA", "cinema", "séries", "animes"],
+        "nao_gosta": ["perder tempo com ruído", "falta de métrica"],
+        "musica": ["pagode"],
+        "esportes_times": ["Flamengo", "NBA"],
+        "series_animes": ["diversos"],
+        "comidas_bebidas": ["açai"],
+        "rotina": {"melhor_horario_interacao": "manhã/à noite", "estilo_aprendizado": "resumos objetivos + links de referência"},
+        "gatilhos_motivacionais": ["OKRs simples", "gráficos de progresso", "tarefas com impacto claro"],
+        "tom_preferido": "objetivo, com toques de humor"
+    }
 }
+
+def _choice(opts):
+    import random
+    return random.choice(opts) if opts else ""
+
+def generate_profile_bio(client_id: str, perfil: dict) -> str:
+    nome   = perfil.get("nome") or (client_id or "").capitalize()
+    idade  = perfil.get("idade")
+    signo  = perfil.get("signo")
+    nasc   = perfil.get("data_nascimento")
+    desc   = (perfil.get("descricao") or "").strip()
+
+    gostos  = perfil.get("gostos", []) or []
+    hobbies = perfil.get("hobbies", []) or []
+    musicas = perfil.get("musica", []) or []
+    times   = perfil.get("esportes_times", []) or []
+    series  = perfil.get("series_animes", []) or []
+    comidas = perfil.get("comidas_bebidas", []) or []
+
+    aberturas = [
+        f"{nome} é {'a' if nome.endswith('a') else 'o'} {'caçula' if client_id=='giulia' else 'pessoa'} que eu conheço bem.",
+        f"Conheço {nome} assim:",
+        f"Pra mim, {nome} é assim:",
+        f"{nome}, em poucas palavras:",
+        f"O jeitão de {nome}:"
+    ]
+
+    fatos = []
+    if idade is not None and signo: fatos.append(f"tem {idade} anos e é de {signo}")
+    elif idade is not None:         fatos.append(f"tem {idade} anos")
+    elif signo:                     fatos.append(f"é de {signo}")
+    if nasc:                        fatos.append(f"nasceu em {nasc}")
+    if times:                       fatos.append(f"torce para {', '.join(times)}")
+    if gostos:                      fatos.append(f"curte {', '.join(gostos[:3])}")
+    if musicas:                     fatos.append(f"gosta de ouvir {', '.join(musicas[:2])}")
+    if series:                      fatos.append(f"tem carinho por {', '.join(series[:2])}")
+    if hobbies:                     fatos.append(f"ama {', '.join(hobbies[:3])}")
+    if comidas:                     fatos.append(f"não resiste a {', '.join(comidas[:2])}")
+
+    import random
+    random.shuffle(fatos)
+    n = 3 if len(fatos) < 3 else random.randint(3, min(5, len(fatos)))
+    blocos = fatos[:n]
+
+    conectores = ["Além disso", "Também", "Fora isso", "De quebra", "E claro"]
+
+    abertura = _choice(aberturas)
+    corpo = []
+    if desc: corpo.append(desc.rstrip(".") + ".")
+    for i, f in enumerate(blocos):
+        corpo.append(f.capitalize() + "." if i == 0 else f"{_choice(conectores)}: {f}.")
+
+    fechamentos = [
+        "Se quiser, eu dou sugestões na vibe dela(e).",
+        "Quer que eu personalize ideias pra ela(e)?",
+        "Posso sugerir algo com base nesse jeitão 😉",
+        ""
+    ]
+    fechamento = _choice(fechamentos)
+
+    tom = (perfil.get("tom_preferido") or "").lower()
+    emoji = ""
+    if "brincalh" in tom or client_id == "giulia": emoji = " 😄"
+    elif client_id == "guilherme":                 emoji = " 🎮"
+    elif client_id == "giovanna":                  emoji = " 💬"
+    elif client_id == "helena":                    emoji = " ☀️"
+    elif client_id == "glauco":                    emoji = " 🎬"
+
+    partes = [abertura, " ".join(corpo)]
+    if fechamento: partes.append(fechamento)
+    return " ".join([p for p in partes if p]).strip() + emoji
+
+def is_profile_question(q: str) -> bool:
+    q = q.lower()
+    gatilhos = [
+        "você me conhece", "voce me conhece",
+        "quem sou eu", "quem eu sou",
+        "sobre mim", "o que eu gosto", "minhas preferências", "minhas preferencias",
+        "me descreve", "me descreva", "fale sobre mim",
+        "quem é a giulia", "quem é o guilherme", "quem é a giovanna", "quem é a helena", "quem é o glauco",
+        "quem e a giulia", "quem e o guilherme", "quem e a giovanna", "quem e a helena", "quem e o glauco",
+        "quem é giulia", "quem é guilherme", "quem é giovanna", "quem é helena", "quem é glauco",
+        "quem e giulia", "quem e guilherme", "quem e giovanna", "quem e helena", "quem e glauco"
+    
+    ]
+    return any(g in q for g in gatilhos)
+
 def is_profile_question(q: str) -> bool:
     q = q.lower()
     gatilhos = [
@@ -2044,9 +2283,47 @@ def ask():
             return jsonify({"answer": answer})
 
         # Perfil (apenas se perguntar)
+        
         if is_profile_question(ql):
             perfil = USER_PROFILES.get((client_id or "").lower())
-            answer = perfil['descricao'] if perfil else f"{user['nome']}, como posso te ajudar hoje?"
+            try:
+                answer = generate_profile_bio(client_id, perfil) if perfil else f"{user['nome']}, como posso te ajudar hoje?"
+            except Exception:
+                answer = perfil['descricao'] if perfil else f"{user['nome']}, como posso te ajudar hoje?"
+            memory.chat_memory.add_user_message(question)
+            memory.chat_memory.add_ai_message(answer)
+            return jsonify({"answer": answer})
+
+
+
+        # Horóscopo (fonte externa) — "meu horóscopo", "horóscopo de touro"
+        if any(k in ql for k in ["horóscopo","horoscopo","meu horóscopo","meu horoscopo"]):
+            sign_en = _extract_sign_from_text_pt(ql)
+            sign_pt = None
+            if not sign_en:
+                perfil = USER_PROFILES.get((client_id or "").lower())
+                sign_pt = (perfil or {}).get("signo")
+                sign_en = _sign_pt_to_en(sign_pt)
+            else:
+                inv = {v:k for k,v in _PT_TO_EN_SIGNS.items()}
+                sign_pt = inv.get(sign_en, sign_en.title())
+            if not sign_en:
+                answer = "Me diz seu signo (ex.: Touro, Virgem) que eu trago o horóscopo de hoje 😉"
+                memory.chat_memory.add_user_message(question)
+                memory.chat_memory.add_ai_message(answer)
+                return jsonify({"answer": answer})
+            cache_key = f"horoscope:{sign_en}:{_today().isoformat()}"
+            cached = _cache_get(cache_key)
+            if cached:
+                answer = cached
+            else:
+                payload = fetch_horoscope(sign_en)
+                if not payload:
+                    answer = "Não consegui buscar o horóscopo agora. Quer tentar de novo mais tarde?"
+                else:
+                    sign_pt = sign_pt or (payload.get("sign") or "").title()
+                    answer = format_horoscope_pt(sign_pt, payload, chat)
+                    _cache_set(cache_key, answer)
             memory.chat_memory.add_user_message(question)
             memory.chat_memory.add_ai_message(answer)
             return jsonify({"answer": answer})
