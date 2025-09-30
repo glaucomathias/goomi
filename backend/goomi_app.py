@@ -108,81 +108,6 @@ def _cache_set(key: str, data: Any):
     _cache[key] = {"ts": time.time(), "data": data}
 
 
-
-# ==== 2B) Horóscopo (fonte externa sem chave) ===============================
-_PT_TO_EN_SIGNS = {
-    "aries": "aries", "áries": "aries",
-    "touro": "taurus", "touros": "taurus",
-    "gemeos": "gemini", "gêmeos": "gemini",
-    "cancer": "cancer", "câncer": "cancer",
-    "leao": "leo", "leão": "leo",
-    "virgem": "virgo", "virgems": "virgo",
-    "libra": "libra",
-    "escorpiao": "scorpio", "escorpião": "scorpio",
-    "sagitario": "sagittarius", "sagitário": "sagittarius",
-    "capricornio": "capricorn", "capricórnio": "capricorn",
-    "aquario": "aquarius", "aquário": "aquarius",
-    "peixes": "pisces", "peixe": "pisces",
-}
-
-def _sign_pt_to_en(sign_pt: str|None) -> str|None:
-    if not sign_pt:
-        return None
-    key = (sign_pt or "").strip().lower()
-    return _PT_TO_EN_SIGNS.get(key)
-
-def _extract_sign_from_text_pt(q: str) -> str|None:
-    ql = (q or "").lower()
-    m = re.search(r"hor[oó]scopo(?:\s+do|\s+da|\s+de)?\s+([a-zçãâáéêíóôõúü]+)", ql, flags=re.IGNORECASE)
-    if m:
-        cand = m.group(1).strip()
-        cand = re.sub(r"^(de|do|da)\s+", "", cand)
-        cand = re.sub(r"(de|do|da|de hoje|de amanh[aã]|hoje|amanh[aã])$", "", cand).strip()
-        en = _sign_pt_to_en(cand)
-        if en:
-            return en
-    for pt in sorted(_PT_TO_EN_SIGNS.keys(), key=len, reverse=True):
-        if re.search(rf"\b{re.escape(pt)}\b", ql):
-            return _PT_TO_EN_SIGNS[pt]
-    return None
-
-def fetch_horoscope(sign_en: str) -> dict|None:
-    try:
-        import requests
-        r = requests.get(f"https://ohmanda.com/api/horoscope/{sign_en}", timeout=6, headers={"User-Agent":"goomi/1.0"})
-        if r.status_code == 200:
-            data = r.json()
-            text = (data.get("horoscope") or "").strip()
-            date_str = data.get("date")
-            if text:
-                return {"date": date_str, "sign": sign_en, "text": text}
-    except Exception:
-        pass
-    try:
-        import requests
-        r = requests.post("https://aztro.sameerkumar.website/", params={"sign": sign_en, "day":"today"}, timeout=6, headers={"User-Agent":"goomi/1.0"})
-        if r.status_code == 200:
-            data = r.json()
-            text = (data.get("description") or "").strip()
-            date_str = data.get("current_date")
-            if text:
-                return {"date": date_str, "sign": sign_en, "text": text}
-    except Exception:
-        pass
-    return None
-
-def format_horoscope_pt(sign_pt: str, payload: dict, chat_model) -> str:
-    raw = payload.get("text","")
-    date_str = payload.get("date") or datetime.date.today().strftime("%Y-%m-%d")
-    from langchain_core.messages import SystemMessage, HumanMessage
-    sys = SystemMessage(content="Você é um assistente que reescreve textos de horóscopo para PT-BR, em 3–5 frases, claro e sem inventar fatos.")
-    hum = HumanMessage(content=f"Reescreva para PT-BR, cite o signo {sign_pt} e a data {date_str}. Texto fonte:\n\n{raw}")
-    try:
-        out = chat_model.invoke([sys, hum]).content.strip()
-        return out
-    except Exception:
-        return f"Horóscopo de {sign_pt} — {date_str}:\n{raw}"
-
 # ==== 3) Flask ===============================================================
 app = Flask(__name__)
 user_memories: Dict[str, ConversationBufferMemory] = {}  # memória RAM por usuário
@@ -694,6 +619,177 @@ def is_profile_question(q: str) -> bool:
         "me descreve", "me descreva", "fale sobre mim"
     ]
     return any(g in q for g in gatilhos)
+
+
+# ==== 7B) Horóscopo — múltiplas fontes + cache por signo+data (PT-BR) ======
+_HORO_CACHE = {}  # {(signo_lower, yyyy-mm-dd): {"texto": str, "fonte": str}}
+
+def _horo_today_str():
+    try:
+        return datetime.now(PROJECT_TZ).strftime("%Y-%m-%d")
+    except Exception:
+        return datetime.now().strftime("%Y-%m-%d")
+
+def _horo_sign_from_text_or_profile(question: str, client_id: str) -> str | None:
+    q = (question or "").lower()
+    signos = [
+        "aries","áries","touro","gemeos","gêmeos","cancer","câncer","leao","leão",
+        "virgem","libra","escorpiao","escorpião","sagitario","sagitário",
+        "capricornio","capricórnio","aquario","aquário","peixes"
+    ]
+    # 1) explícito no texto
+    for s in signos:
+        if re.search(rf"\b{s}\b", q):
+            return s
+    # 2) perfil do usuário
+    perfil = USER_PROFILES.get((client_id or "").lower()) or {}
+    s = (perfil.get("signo") or "").lower().strip()
+    return s or None
+
+def _horo_sign_to_num(signo_pt: str) -> int | None:
+    mapa = {
+        "aries":1, "áries":1,
+        "touro":2,
+        "gemeos":3, "gêmeos":3,
+        "cancer":4, "câncer":4,
+        "leao":5, "leão":5,
+        "virgem":6,
+        "libra":7,
+        "escorpiao":8, "escorpião":8,
+        "sagitario":9, "sagitário":9,
+        "capricornio":10, "capricórnio":10,
+        "aquario":11, "aquário":11,
+        "peixes":12
+    }
+    return mapa.get((signo_pt or "").lower().strip())
+
+def _strip_lead_date_en(txt: str) -> str:
+    """
+    Remove prefixos tipo 'Sep 28, 2025 - ' que vêm do Horoscope.com.
+    """
+    if not txt:
+        return txt
+    # Formatos comuns: 'Sep 28, 2025 - ' ; 'September 28, 2025 - '
+    txt2 = re.sub(r"^(?:[A-Z][a-z]{2,9}\s+\d{1,2},\s+\d{4}\s+-\s+)", "", txt).strip()
+    return txt2
+
+def _looks_english(text: str) -> bool:
+    """
+    Heurística simples: presença de palavras muito comuns do inglês e baixa acentuação.
+    """
+    if not text:
+        return False
+    sample = text[:200].lower()
+    common = [" the ", " you ", " your ", " and ", " but ", " with ", " today ", " will ", " may ", " could "]
+    score = sum(1 for w in common if w in " " + sample + " ")
+    # poucos acentos -> mais chance de inglês
+    has_accent = bool(re.search(r"[áéíóúâêôãõç]", sample))
+    return score >= 2 and not has_accent
+
+def _translate_to_pt_br(text: str) -> str:
+    """
+    Tradução fiel e natural para PT-BR usando o modelo já configurado (chat).
+    Não adiciona conteúdo, não muda sentido.
+    """
+    try:
+        sys = SystemMessage(content="Traduza para PT-BR de forma natural e fiel, sem acrescentar informações.")
+        hum = HumanMessage(content=text)
+        out = chat.invoke([sys, hum]).content.strip()
+        return out or text
+    except Exception:
+        return text
+
+def _horo_fetch_aztro(signo_pt: str) -> str | None:
+    try:
+        import requests as _r
+        en = {
+            "aries":"aries","áries":"aries","touro":"taurus",
+            "gemeos":"gemini","gêmeos":"gemini",
+            "cancer":"cancer","câncer":"cancer",
+            "leao":"leo","leão":"leo","virgem":"virgo",
+            "libra":"libra",
+            "escorpiao":"scorpio","escorpião":"scorpio",
+            "sagitario":"sagittarius","sagitário":"sagittarius",
+            "capricornio":"capricorn","capricórnio":"capricorn",
+            "aquario":"aquarius","aquário":"aquarius",
+            "peixes":"pisces"
+        }.get((signo_pt or "").lower())
+        if not en:
+            return None
+        r = _r.post(f"https://aztro.sameerkumar.website/?sign={en}&day=today", timeout=12)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        txt = (data.get("description") or "").strip()
+        return txt or None
+    except Exception:
+        return None
+
+def _horo_fetch_horoscope_com(signo_pt: str) -> str | None:
+    """
+    Scrape do Horoscope.com (em inglês). Captura o parágrafo principal.
+    """
+    try:
+        num = _horo_sign_to_num(signo_pt)
+        if not num:
+            return None
+        import requests as _r
+        from bs4 import BeautifulSoup
+        url = f"https://www.horoscope.com/us/horoscopes/general/horoscope-general-daily-today.aspx?sign={num}"
+        resp = _r.get(url, timeout=12, headers={"User-Agent":"Mozilla/5.0"})
+        if resp.status_code != 200:
+            return None
+        soup = BeautifulSoup(resp.text, "html.parser")
+        # seletores alternativos estáveis
+        p = soup.select_one("[data-test='daily-horoscope']") or soup.select_one(".main-horoscope p")
+        txt = (p.get_text(" ", strip=True) if p else "").strip()
+        return txt or None
+    except Exception:
+        return None
+
+def horoscope_get(question: str, client_id: str) -> tuple[str | None, str | None]:
+    """
+    Retorna (texto_pt, fonte). Usa cache (signo+data) APÓS traduzir.
+    Ordem: Aztro -> Horoscope.com -> fallback modelo.
+    """
+    signo = _horo_sign_from_text_or_profile(question, client_id)
+    if not signo:
+        return None, None
+
+    key = ((signo or "").lower().strip(), _horo_today_str())
+    if key in _HORO_CACHE:
+        c = _HORO_CACHE[key]
+        return c["texto"], c["fonte"]
+
+    # 1) Aztro (pode vir EN/EN-pt)
+    txt = _horo_fetch_aztro(signo)
+    if txt:
+        txt = _strip_lead_date_en(txt)
+        if _looks_english(txt):
+            txt = _translate_to_pt_br(txt)
+        _HORO_CACHE[key] = {"texto": txt, "fonte": "Aztro"}
+        return txt, "Aztro"
+
+    # 2) Horoscope.com (vem em inglês)
+    txt = _horo_fetch_horoscope_com(signo)
+    if txt:
+        txt = _strip_lead_date_en(txt)
+        if _looks_english(txt):
+            txt = _translate_to_pt_br(txt)
+        _HORO_CACHE[key] = {"texto": txt, "fonte": "Horoscope.com"}
+        return txt, "Horoscope.com"
+
+    # 3) Fallback com modelo (sempre PT-BR)
+    try:
+        prompt = HumanMessage(content=f"Escreva um horóscopo do dia (4–6 linhas, PT-BR) para o signo de {signo.title()}, tom amigável e prático.")
+        resp = chat.invoke([SYSTEM_PROMPT, prompt]).content.strip()
+        if resp:
+            _HORO_CACHE[key] = {"texto": resp, "fonte": "Modelo (fallback)"}
+            return resp, "Modelo (fallback)"
+    except Exception:
+        pass
+
+    return None, None
 
 
 # ==== 8) Esportes — API-Football ============================================
@@ -1987,7 +2083,6 @@ def _sanitize_league_phrase(txt: str) -> str:
     return t.strip(" ,.;:-")
 
 
-
 # ==== Manual / Ajuda =========================================================
 def _manual_saude() -> str:
     return (
@@ -2018,8 +2113,35 @@ def _manual_esportes() -> str:
         "• Série B hoje: \"Quais são os jogos da Série B hoje?\"\n"
         "• Jogos óbvios: \"Quais os jogos óbvios de hoje?\"\n"
         "• Projeções Série B: \"Faça as projeções da Série B\"\n"
-        "• Time específico: \"Flamengo joga hoje?\"\n"
+        "• Time específico (hoje/ontem/amanhã ou data): \"Flamengo joga hoje?\", \"Flamengo jogou ontem?\", \"Flamengo no dia 28/09/2025\"\n"
         "• Liga específica: \"Quais os jogos da Premier League hoje?\""
+    )
+
+def _manual_horoscopo() -> str:
+    return (
+        "Manual — Horóscopo\n\n"
+        "• Pergunta geral: \"Qual é o meu horóscopo de hoje?\" (usa seu signo do perfil automaticamente)\n"
+        "• Por signo: \"Qual é o horóscopo de Virgem hoje?\"\n"
+        "Notas:\n"
+        "• O texto vem em PT-BR. Se a fonte estiver em inglês, eu traduzo automaticamente.\n"
+        "• Fontes usadas: Aztro e Horoscope.com; se ambas falharem, gero um texto curto (fallback)."
+    )
+
+def _manual_busca_web() -> str:
+    return (
+        "Manual — Busca na Web (resumo limpo + fontes curtas)\n\n"
+        "Como perguntar (não precisa mais escrever \"Busca na web:\"):\n"
+        "• \"resuma as notícias do Flamengo hoje\"\n"
+        "• \"como foi o jogo do Flamengo e Corinthians ontem\"\n"
+        "• \"benefícios do protetor solar diário\"\n"
+        "Datas naturais entendidas: hoje, amanhã, ontem, e formato dd/mm/aaaa.\n\n"
+        "Dicas úteis:\n"
+        "• Filtrar site: \"resuma as notícias do Flamengo hoje site:uol.com.br\"\n"
+        "• Pedir poucas fontes: \"… com 1 fonte\" ou \"… com até 2 fontes\"\n"
+        "• Esconder fontes: \"… sem mostrar as fontes\" (eu mantenho a checagem, só não exibo)\n\n"
+        "Saída:\n"
+        "• Entrego um parágrafo objetivo respondendo sua pergunta (não só títulos).\n"
+        "• Mostro 1–3 fontes em links curtos. Se quiser mais, peça: \"me mostre mais fontes\"."
     )
 
 def _manual_geral() -> str:
@@ -2027,22 +2149,57 @@ def _manual_geral() -> str:
         "Manual — GOOMI (resumo)\n\n"
         "• saúde — veja: \"Goomi, quais são as funções da saúde?\"\n"
         "• notas — veja: \"Goomi, quais são as funcionalidades das notas?\"\n"
-        "• esportes — veja: \"Goomi, ajuda de esportes\""
+        "• esportes — veja: \"Goomi, ajuda de esportes\"\n"
+        "• horóscopo — veja: \"Goomi, ajuda de horóscopo\"\n"
+        "• web — veja: \"Goomi, como usar a busca na web\""
     )
 
 def manual_router(q: str) -> str | None:
     ql = (q or "").lower()
-    if any(k in ql for k in ["quais são as funções da saúde","quais sao as funcoes da saude","ajuda de saude","manual de saude","como eu salvo as consultas","como salvar consulta","como registrar consulta"]):
+
+    # Saúde
+    if any(k in ql for k in [
+        "quais são as funções da saúde","quais sao as funcoes da saude",
+        "ajuda de saude","manual de saude","como eu salvo as consultas",
+        "como salvar consulta","como registrar consulta"
+    ]):
         return _manual_saude()
-    if any(k in ql for k in ["funcionalidades das notas","funções das notas","ajuda de notas","manual de notas","como salvar nota"]):
+
+    # Notas
+    if any(k in ql for k in [
+        "funcionalidades das notas","funções das notas","funcoes das notas",
+        "ajuda de notas","manual de notas","como salvar nota"
+    ]):
         return _manual_notas()
-    if any(k in ql for k in ["ajuda de esportes","manual de esportes","funções dos esportes","quais são as funções dos esportes","jogos obvios ajuda","projeções ajuda","projecoes ajuda"]):
+
+    # Esportes
+    if any(k in ql for k in [
+        "ajuda de esportes","manual de esportes","funções dos esportes","funcoes dos esportes",
+        "jogos obvios ajuda","jogos óbvios ajuda","projeções ajuda","projecoes ajuda"
+    ]):
         return _manual_esportes()
-    if any(k in ql for k in ["ajuda","manual","como funciona o goomi","o que você faz","quais suas funções","quais sao suas funcoes"]):
+
+    # Horóscopo
+    if any(k in ql for k in [
+        "ajuda de horóscopo","ajuda de horoscopo","manual de horóscopo","manual de horoscopo"
+    ]):
+        return _manual_horoscopo()
+
+    # Busca Web
+    if any(k in ql for k in [
+        "ajuda de busca","ajuda da web","manual de busca","manual da web",
+        "como usar a busca na web","como pesquisar na web","como usar a web"
+    ]):
+        return _manual_busca_web()
+
+    # Geral
+    if any(k in ql for k in [
+        "ajuda","manual","como funciona o goomi","o que você faz","o que voce faz",
+        "quais suas funções","quais sao suas funcoes"
+    ]):
         return _manual_geral()
+
     return None
-
-
 
 # ==== OVERRIDES: Saúde — parser e buscadores (ajuste de descrição/médico) ===
 def _health_extract_details_pt(text: str):
@@ -2293,40 +2450,27 @@ def ask():
             memory.chat_memory.add_user_message(question)
             memory.chat_memory.add_ai_message(answer)
             return jsonify({"answer": answer})
-
-
-
-        # Horóscopo (fonte externa) — "meu horóscopo", "horóscopo de touro"
-        if any(k in ql for k in ["horóscopo","horoscopo","meu horóscopo","meu horoscopo"]):
-            sign_en = _extract_sign_from_text_pt(ql)
-            sign_pt = None
-            if not sign_en:
-                perfil = USER_PROFILES.get((client_id or "").lower())
-                sign_pt = (perfil or {}).get("signo")
-                sign_en = _sign_pt_to_en(sign_pt)
+        
+        # Horóscopo — dispara se a pergunta mencionar 'horóscopo'/'horoscopo'
+        if any(k in ql for k in ["horóscopo","horoscopo"]):
+            txt, fonte = horoscope_get(question, client_id)
+            if txt:
+                answer = f"Horóscopo de {(_horo_sign_from_text_or_profile(question, client_id) or '').title()} (hoje)\n\n{txt}\n\nFonte: {fonte}."
             else:
-                inv = {v:k for k,v in _PT_TO_EN_SIGNS.items()}
-                sign_pt = inv.get(sign_en, sign_en.title())
-            if not sign_en:
-                answer = "Me diz seu signo (ex.: Touro, Virgem) que eu trago o horóscopo de hoje 😉"
-                memory.chat_memory.add_user_message(question)
-                memory.chat_memory.add_ai_message(answer)
-                return jsonify({"answer": answer})
-            cache_key = f"horoscope:{sign_en}:{_today().isoformat()}"
-            cached = _cache_get(cache_key)
-            if cached:
-                answer = cached
-            else:
-                payload = fetch_horoscope(sign_en)
-                if not payload:
-                    answer = "Não consegui buscar o horóscopo agora. Quer tentar de novo mais tarde?"
-                else:
-                    sign_pt = sign_pt or (payload.get("sign") or "").title()
-                    answer = format_horoscope_pt(sign_pt, payload, chat)
-                    _cache_set(cache_key, answer)
+                answer = "Não consegui buscar o horóscopo agora. Quer tentar de novo mais tarde?"
             memory.chat_memory.add_user_message(question)
             memory.chat_memory.add_ai_message(answer)
             return jsonify({"answer": answer})
+
+        # Busca na Web — só se a pergunta começar com 'Busca na web:'
+        if is_websearch_trigger(question):
+            q_busca = (question.split(":",1)[1] or "").strip() if ":" in question else question
+            summary = web_search_summarize(q_busca, max_sources=4)
+            answer = summary or "Não achei conteúdo confiável agora. Quer refinar a busca (ex.: incluir palavra-chave principal e um site)?"
+            memory.chat_memory.add_user_message(question)
+            memory.chat_memory.add_ai_message(answer)
+            return jsonify({"answer": answer})
+
 
         # ===================== SAÚDE (Helena) — PRIORIDADE SOBRE NOTAS =====================
         health = extrair_comando_saude(question, client_id)
@@ -2974,6 +3118,316 @@ def ask():
         try: conn.close()
         except: pass
 
+# ==== 14B) Busca na Web (DDGS) — resumo objetivo (jogo x notícias), PT-BR, fontes enxutas ====
+
+# ==== 14B) Busca na Web (DDGS) — resumo objetivo (jogo x notícias), PT-BR, fontes enxutas ====
+
+def _pt_rel_date(texto: str):
+    """
+    Converte 'ontem', 'hoje', 'amanhã/amanha' em YYYY-MM-DD usando os helpers do app.
+    Também tenta dd/mm/aaaa se existir na frase.
+    """
+    q = (texto or "").lower()
+    d_exp = _parse_pt_date_in_text(q)
+    if d_exp:
+        return d_exp.strftime("%Y-%m-%d")
+    if "ontem" in q:
+        return _yesterday().strftime("%Y-%m-%d")
+    if "amanh" in q:  # amanha/amanhã
+        return _tomorrow().strftime("%Y-%m-%d")
+    if "hoje" in q:
+        return _today().strftime("%Y-%m-%d")
+    return None
+
+
+def is_websearch_trigger(texto: str) -> bool:
+    """
+    Dispara com comandos naturais (não precisa 'busca na web:').
+    """
+    if not texto:
+        return False
+    t = texto.strip().lower()
+    if "busca na web" in t:
+        return True
+    return t.startswith(("busca", "pesquisa", "procura", "ache", "resumo"))
+
+
+def _compact_domain(url: str) -> str:
+    try:
+        from urllib.parse import urlparse
+        netloc = urlparse(url).netloc.lower()
+        return netloc[4:] if netloc.startswith("www.") else netloc
+    except Exception:
+        return url
+
+
+def _is_opinion_like(title: str, url: str) -> bool:
+    t = (title or "").lower()
+    u = (url or "").lower()
+    flags = ("coluna", "opinião", "opiniao", "blog", "comentário", "editorial", "analise", "análise")
+    return any(f in t for f in flags) or any(f in u for f in flags)
+
+
+def _trust_score(url: str) -> int:
+    """
+    Heurística simples para priorizar fontes mais confiáveis e de esporte.
+    """
+    dom = _compact_domain(url)
+    prefs = [
+        "ge.globo.com", "uol.com.br", "espn.com.br", "lance.com.br",
+        "terra.com.br", "oglobo.globo.com", "estadao.com.br", "g1.globo.com",
+        "bbc.com", "reuters.com", "apnews.com"
+    ]
+    for i, d in enumerate(prefs):
+        if d in dom:
+            return 200 - i * 3
+    return max(10, 80 - len(dom))
+
+
+def _is_match_query(q: str) -> bool:
+    ql = (q or "").lower()
+    return any(k in ql for k in ("jogo", "partida", "placar", "resultado")) or " x " in ql or "vs" in ql
+
+
+def web_search_raw(query: str, max_results: int = 10) -> list[dict]:
+    """
+    Busca via DDGS (novo pacote). Retorna [{title, href, body}].
+    """
+    try:
+        from ddgs import DDGS
+    except Exception as e:
+        if DEBUG_LOG:
+            print("[WEB] ddgs ausente:", e)
+        return []
+
+    out = []
+    try:
+        with DDGS() as ddgs:
+            for r in ddgs.text(query, region="br-pt", safesearch="moderate", max_results=max_results):
+                if not r or not r.get("href"):
+                    continue
+                out.append({
+                    "title": (r.get("title") or "").strip(),
+                    "href": r.get("href"),
+                    "body": (r.get("body") or "").strip()
+                })
+    except Exception as e:
+        if DEBUG_LOG:
+            print("[WEB][ddg] erro:", e)
+        return []
+    return out
+
+
+def _http_get(url: str, timeout: int = 10) -> str:
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; GoomihBot/1.0)"}
+        r = requests.get(url, headers=headers, timeout=timeout)
+        if 200 <= r.status_code < 300:
+            return r.text
+    except Exception as e:
+        if DEBUG_LOG:
+            print("[WEB][get] erro:", e)
+    return ""
+
+
+def _extract_readable_text(html: str) -> str:
+    """
+    Usa readability para isolar o conteúdo principal e BS4 para texto limpo.
+    """
+    if not html:
+        return ""
+    try:
+        from readability import Document
+        from bs4 import BeautifulSoup
+        doc = Document(html)
+        summary_html = doc.summary() or ""
+        soup = BeautifulSoup(summary_html, "lxml")
+        text = soup.get_text(separator=" ", strip=True)
+        text = re.sub(r"\s+", " ", text)
+        return text[:6000]
+    except Exception as e:
+        if DEBUG_LOG:
+            print("[WEB][extract] erro:", e)
+        return ""
+
+
+def _collect_page_text(url: str) -> str:
+    return _extract_readable_text(_http_get(url))
+
+
+def _keywords_from_query(q: str) -> list[str]:
+    ql = (q or "").lower()
+    seeds = []
+    for w in ("flamengo", "corinthians", "palmeiras", "brasileirão", "resultado",
+              "resumo", "jogo", "placar", "gols", "rodada", "estádio",
+              "maracanã", "neo química"):
+        if w in ql:
+            seeds.append(w)
+    dref = _pt_rel_date(q)
+    if dref:
+        seeds.append(dref)
+    return list(dict.fromkeys(seeds))
+
+
+def _pick_sentences_focus(text: str, query: str, max_sent: int = 5) -> list[str]:
+    """
+    Seleciona sentenças informativas (curtas/médias) com viés para eventos (placar, gols, quem/quanto/onde/quando).
+    """
+    if not text:
+        return []
+    sents = re.split(r"(?<=[\.\!\?])\s+", text)
+    seeds = _keywords_from_query(query)
+    scored = []
+    for s in sents:
+        st = s.strip()
+        if not (30 <= len(st) <= 220):
+            continue
+        score = 0
+        if re.search(r"\b\d{1,2}\s*[x\-]\s*\d{1,2}\b", st):  # 2 x 1 / 4-0
+            score += 5
+        if re.search(r"\bminuto", st.lower()) or re.search(r"\bsegundo tempo|\bprimeiro tempo", st.lower()):
+            score += 1
+        if any(kw in st.lower() for kw in ("gol", "gols", "virada", "vitória", "derrota", "empate", "rodada",
+                                           "pênalti", "penalti", "estádio", "maracanã", "neo química")):
+            score += 1
+        for kw in seeds:
+            if kw in st.lower():
+                score += 1
+        if score > 0:
+            scored.append((score, st))
+    if not scored:
+        base = [s.strip() for s in sents if 30 <= len(s.strip()) <= 220]
+        return base[:max_sent]
+    scored.sort(key=lambda x: (-x[0], len(x[1])))
+    return [s for _, s in scored[:max_sent]]
+
+
+def _extract_score_hint(text: str) -> str | None:
+    m = re.search(r"([A-Za-zÀ-ÿ ]+?)\s+(\d{1,2})\s*[x\-]\s*(\d{1,2})\s+([A-Za-zÀ-ÿ ]+)", text)
+    if m:
+        t1, g1, g2, t2 = m.group(1).strip(), m.group(2), m.group(3), m.group(4).strip()
+        return f"{t1} {g1} x {g2} {t2}"
+    return None
+
+
+def _is_bad_result(item: dict) -> bool:
+    title = (item.get("title") or "")
+    href = (item.get("href") or "")
+    if _is_opinion_like(title, href):
+        return True
+    # evita páginas muito genéricas de capa
+    dom = _compact_domain(href)
+    if dom in ("uol.com.br", "ge.globo.com") and not any(k in href for k in ("/jogo", "/noticia", "/futebol/")):
+        return True
+    return False
+
+
+def _rank_result(item: dict, match_mode: bool) -> int:
+    base = _trust_score(item["href"])
+    title = (item.get("title") or "").lower()
+    bonus = 0
+    if match_mode:
+        if any(k in title for k in ("flamengo", "corinthians", "resumo", "placar", "melhores momentos", "gols")):
+            bonus += 15
+    else:
+        if any(k in title for k in ("flamengo", "notícias", "ultimas", "resumo")):
+            bonus += 8
+    # penaliza opinião
+    if _is_opinion_like(item.get("title", ""), item.get("href", "")):
+        bonus -= 25
+    return -(base + bonus)
+
+
+def web_search_summarize(query_in: str, max_sources: int = 2) -> str | None:
+    q_raw = (query_in or "").strip()
+    if not q_raw:
+        return None
+
+    # Enriquecer com data relativa
+    dref = _pt_rel_date(q_raw)
+    q = f"{q_raw} {dref}" if dref and dref not in q_raw else q_raw
+
+    match_mode = _is_match_query(q)
+    results = web_search_raw(q, max_results=12)
+    if not results:
+        return None
+
+    # ordenar + filtrar
+    results.sort(key=lambda it: _rank_result(it, match_mode))
+    filtered = [r for r in results if not _is_bad_result(r)]
+    if not filtered:
+        filtered = results[:3]
+
+    # coletar 1–2 textos reais de domínios distintos
+    texts, fontes, used_domains = [], [], set()
+    for r in filtered:
+        url = r["href"]
+        dom = _compact_domain(url)
+        if dom in used_domains:
+            continue
+        used_domains.add(dom)
+        txt = _collect_page_text(url)
+        if not txt:
+            # fallback: snippet do DDG, mas limpo e curto
+            sn = (r.get("body") or r.get("title") or "").strip()
+            sn = re.sub(r"\s+", " ", sn)
+            txt = sn[:500]
+        if not txt:
+            continue
+        texts.append(txt)
+        fontes.append(f"{dom} — {url}")
+        if len(texts) >= max_sources:
+            break
+
+    if not texts:
+        return None
+
+    joined = " ".join(texts)
+
+    if match_mode:
+        # TEMPLATE — resumo de jogo
+        score = _extract_score_hint(joined)
+        bullets = _pick_sentences_focus(joined, q, max_sent=4)
+        # Tenta puxar competição/estádio
+        comp = None
+        est = None
+        m_comp = re.search(r"(Brasileir[aã]o|Copa do Brasil|Libertadores|Sul[- ]Americana)", joined, re.IGNORECASE)
+        if m_comp:
+            comp = m_comp.group(1)
+        if "maracanã" in joined.lower():
+            est = "Maracanã"
+        elif "neo química" in joined.lower():
+            est = "Neo Química Arena"
+
+        linhas = []
+        linhas.append("Resumo do jogo (busca na web):")
+        if score:
+            extra = f" ({comp}, {est})" if (comp or est) else ""
+            linhas.append(f"- Placar: {score}{extra}")
+        for b in bullets:
+            linhas.append(f"- {b}")
+        # fontes enxutas (só 1)
+        fontes_txt = "\nFonte: " + "; ".join(fontes[:1]) if fontes else ""
+        return "\n".join(linhas) + fontes_txt
+
+    else:
+        # TEMPLATE — notícias gerais (3 bullets)
+        bullets = _pick_sentences_focus(joined, q, max_sent=3)
+        if not bullets:
+            # fallback: usa títulos/snippets limpos
+            for r in filtered[:3]:
+                sn = (r.get("body") or r.get("title") or "").strip()
+                sn = re.sub(r"\s+", " ", sn)
+                if sn:
+                    bullets.append(sn[:220])
+            bullets = bullets[:3]
+
+        linhas = ["Resumo (busca na web):"]
+        for b in bullets[:3]:
+            linhas.append(f"- {b}")
+        fontes_txt = "\nFonte: " + "; ".join(fontes[:1]) if fontes else ""
+        return "\n".join(linhas) + fontes_txt
+# ==== /14B) FIM ====
 
 # ==== 15) Inicialização ======================================================
 if __name__ == "__main__":
