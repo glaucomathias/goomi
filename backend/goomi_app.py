@@ -3118,191 +3118,14 @@ def ask():
         try: conn.close()
         except: pass
 
-# ==== 14B) Busca na Web (DDGS) — resumo objetivo + filtro por data relativa (PT-BR) ====
-import re, calendar
-from datetime import datetime, timedelta, date
+# ==== 14B) Busca na Web (DDGS) — resumo objetivo (jogo x notícias), PT-BR, fontes enxutas ====
 
-# Helpers de data do app já existentes (mantidos):
-# _today(), _yesterday(), _tomorrow()  -> date
-# TIMEZONE/TZ não é necessário aqui; usamos apenas datas (YYYY-MM-DD).
-
-_PT_MONTHS = {
-    "janeiro":1,"fevereiro":2,"marco":3,"março":3,"abril":4,"maio":5,"junho":6,
-    "julho":7,"agosto":8,"setembro":9,"outubro":10,"novembro":11,"dezembro":12
-}
-
-def _start_of_week(d: date) -> date:
-    # segunda-feira como início
-    return d - timedelta(days=d.weekday())
-
-def _end_of_week(d: date) -> date:
-    return _start_of_week(d) + timedelta(days=6)
-
-def _start_of_month(d: date) -> date:
-    return d.replace(day=1)
-
-def _end_of_month(d: date) -> date:
-    last = calendar.monthrange(d.year, d.month)[1]
-    return d.replace(day=last)
-
-def _safe_date(y: int, m: int, d: int) -> date | None:
-    try:
-        return date(y, m, d)
-    except Exception:
-        return None
-
-def _pt_rel_window(texto: str) -> tuple[date | None, date | None, str]:
-    """
-    Retorna (start_date, end_date, label) com base em expressões de tempo PT-BR no texto.
-    Cobertura: hoje, ontem, amanhã, esta semana/este mês/este ano,
-               semana passada, mês passado, ano passado, semana que vem, mês que vem, ano que vem.
-    Se nada for detectado: (None, None, "").
-    """
-    t = (texto or "").lower()
-    hoje = _today()
-
-    # Normalizações simples
-    t = t.replace("amanhã", "amanha").replace("próxima", "proxima").replace("próximo", "proximo")
-
-    # Dia específico
-    if "hoje" in t:
-        return (hoje, hoje, "hoje")
-    if "ontem" in t:
-        y = _yesterday()
-        return (y, y, "ontem")
-    if "amanha" in t:
-        am = _tomorrow()
-        return (am, am, "amanha")
-
-    # Semana atual / passada / que vem
-    if "esta semana" in t or "essa semana" in t or "semana atual" in t:
-        return (_start_of_week(hoje), _end_of_week(hoje), "esta semana")
-    if "semana passada" in t:
-        fim_passada = _start_of_week(hoje) - timedelta(days=1)
-        ini_passada = _start_of_week(fim_passada)
-        return (ini_passada, fim_passada, "semana passada")
-    if "semana que vem" in t or "proxima semana" in t:
-        ini = _end_of_week(hoje) + timedelta(days=1)
-        fim = _end_of_week(ini)
-        return (ini, fim, "semana que vem")
-
-    # Mês atual / passado / que vem
-    if "este mes" in t or "esse mes" in t or "mês atual" in t or "este mês" in t:
-        return (_start_of_month(hoje), _end_of_month(hoje), "este mês")
-    if "mes passado" in t or "mês passado" in t:
-        m = (hoje.month - 1) or 12
-        y = hoje.year - 1 if hoje.month == 1 else hoje.year
-        ini = date(y, m, 1)
-        fim = _end_of_month(ini)
-        return (ini, fim, "mês passado")
-    if "mes que vem" in t or "mês que vem" in t or "proximo mes" in t or "próximo mês" in t:
-        m = (hoje.month % 12) + 1
-        y = hoje.year + (1 if hoje.month == 12 else 0)
-        ini = date(y, m, 1)
-        fim = _end_of_month(ini)
-        return (ini, fim, "mês que vem")
-
-    # Ano atual / passado / que vem
-    if "este ano" in t or "esse ano" in t or "ano atual" in t:
-        return (date(hoje.year, 1, 1), date(hoje.year, 12, 31), "este ano")
-    if "ano passado" in t:
-        y = hoje.year - 1
-        return (date(y, 1, 1), date(y, 12, 31), "ano passado")
-    if "ano que vem" in t or "proximo ano" in t:
-        y = hoje.year + 1
-        return (date(y, 1, 1), date(y, 12, 31), "ano que vem")
-
-    # Nada detectado
-    return (None, None, "")
-
-def _parse_date_from_url(url: str) -> date | None:
-    """
-    Detecta datas em URLs comuns: /YYYY/MM/DD/ ou /YYYY/MM/ etc.
-    Ex.: .../2025/10/02/..., .../2025/10/...
-    """
-    if not url:
-        return None
-    m = re.search(r"/(20\d{2})/([01]\d)/([0-3]\d)/", url)
-    if m:
-        d = _safe_date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
-        if d: return d
-    m = re.search(r"/(20\d{2})/([01]\d)/", url)
-    if m:
-        d = _safe_date(int(m.group(1)), int(m.group(2)), 1)
-        if d: return d
-    # dd-mm-yyyy
-    m = re.search(r"/([0-3]\d)[\-\_](0\d|1[0-2])[\-\_](20\d{2})", url)
-    if m:
-        d = _safe_date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
-        if d: return d
-    return None
-
-def _parse_date_from_text(txt: str) -> date | None:
-    """
-    Lê datas em PT no título/snippet: 02/10/2025, 2/10, '14 de fevereiro de 2025', 'há 3 horas/dias', 'ontem/hoje'.
-    Retorna a data (no caso de 'há X horas/dias', converte relativo a hoje).
-    """
-    if not txt:
-        return None
-    s = txt.lower()
-
-    # hoje/ontem
-    if "hoje" in s:
-        return _today()
-    if "ontem" in s:
-        return _yesterday()
-
-    # há X horas/dias
-    m = re.search(r"há\s+(\d+)\s+hora", s)
-    if m:
-        h = int(m.group(1))
-        d = _today()
-        # se for "há X horas", tratamos como hoje
-        return d
-    m = re.search(r"há\s+(\d+)\s+dia", s)
-    if m:
-        dias = int(m.group(1))
-        return _today() - timedelta(days=dias)
-
-    # dd/mm/yyyy ou d/m/yyyy
-    m = re.search(r"\b([0-3]?\d)/([01]?\d)/(20\d{2})\b", s)
-    if m:
-        d = _safe_date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
-        if d: return d
-
-    # d/m (assume ano atual)
-    m = re.search(r"\b([0-3]?\d)/([01]?\d)\b", s)
-    if m:
-        d = _safe_date(_today().year, int(m.group(2)), int(m.group(1)))
-        if d: return d
-
-    # '14 de fevereiro de 2025' | '14 de fevereiro'
-    m = re.search(r"\b([0-3]?\d)\s+de\s+([a-zçãéóíú]+)\s+de\s+(20\d{2})\b", s)
-    if m:
-        dia = int(m.group(1)); mes = _PT_MONTHS.get(m.group(2), 0); ano = int(m.group(3))
-        d = _safe_date(ano, mes, dia)
-        if d: return d
-    m = re.search(r"\b([0-3]?\d)\s+de\s+([a-zçãéóíú]+)\b", s)
-    if m:
-        dia = int(m.group(1)); mes = _PT_MONTHS.get(m.group(2), 0); ano = _today().year
-        d = _safe_date(ano, mes, dia)
-        if d: return d
-
-    return None
-
-def _guess_item_date(item: dict) -> date | None:
-    # tenta URL, depois título/snippet
-    d = _parse_date_from_url(item.get("href") or "")
-    if d: return d
-    d = _parse_date_from_text(item.get("title") or "")
-    if d: return d
-    d = _parse_date_from_text(item.get("body") or "")
-    return d  # pode ser None
+# ==== 14B) Busca na Web (DDGS) — resumo objetivo (jogo x notícias), PT-BR, fontes enxutas ====
 
 def _pt_rel_date(texto: str):
     """
-    Mantido: resolve datas exatas simples (hoje/ontem/amanhã) para enriquecer a query textual,
-    mas o filtro real será feito pela janela (_pt_rel_window).
+    Converte 'ontem', 'hoje', 'amanhã/amanha' em YYYY-MM-DD usando os helpers do app.
+    Também tenta dd/mm/aaaa se existir na frase.
     """
     q = (texto or "").lower()
     d_exp = _parse_pt_date_in_text(q)
@@ -3316,17 +3139,18 @@ def _pt_rel_date(texto: str):
         return _today().strftime("%Y-%m-%d")
     return None
 
+
 def is_websearch_trigger(texto: str) -> bool:
+    """
+    Dispara com comandos naturais (não precisa 'busca na web:').
+    """
     if not texto:
         return False
     t = texto.strip().lower()
-    if not t:
-        return False
-    if any(k in t for k in ("flamengo", "notícias", "noticia", "resumo", "brasileirão", "jogo", "placar", "resultado", "onde assistir")):
-        return True
-    if "web" in t:
+    if "busca na web" in t:
         return True
     return t.startswith(("busca", "pesquisa", "procura", "ache", "resumo"))
+
 
 def _compact_domain(url: str) -> str:
     try:
@@ -3336,12 +3160,18 @@ def _compact_domain(url: str) -> str:
     except Exception:
         return url
 
+
 def _is_opinion_like(title: str, url: str) -> bool:
-    t = (title or "").lower(); u = (url or "").lower()
+    t = (title or "").lower()
+    u = (url or "").lower()
     flags = ("coluna", "opinião", "opiniao", "blog", "comentário", "editorial", "analise", "análise")
     return any(f in t for f in flags) or any(f in u for f in flags)
 
+
 def _trust_score(url: str) -> int:
+    """
+    Heurística simples para priorizar fontes mais confiáveis e de esporte.
+    """
     dom = _compact_domain(url)
     prefs = [
         "ge.globo.com", "uol.com.br", "espn.com.br", "lance.com.br",
@@ -3353,64 +3183,96 @@ def _trust_score(url: str) -> int:
             return 200 - i * 3
     return max(10, 80 - len(dom))
 
+
 def _is_match_query(q: str) -> bool:
     ql = (q or "").lower()
     return any(k in ql for k in ("jogo", "partida", "placar", "resultado")) or " x " in ql or "vs" in ql
 
-def _safe_ddg_text_search(query: str, max_results: int = 10) -> list[dict]:
-    providers = []
-    try:
-        from ddgs import DDGS as DDGS1
-        providers.append(("ddgs", DDGS1))
-    except Exception as e:
-        if DEBUG_LOG: print("[WEB] pacote ddgs indisponível:", e)
-    try:
-        from duckduckgo_search import DDGS as DDGS2
-        providers.append(("duckduckgo_search", DDGS2))
-    except Exception as e:
-        if DEBUG_LOG: print("[WEB] pacote duckduckgo_search indisponível:", e)
-
-    if not providers:
-        return []
-
-    def _run(Provider):
-        out = []
-        kw = dict(region="br-pt", safesearch="moderate", max_results=max_results)
-        if "safesearch" not in Provider.text.__code__.co_varnames and "safe" in Provider.text.__code__.co_varnames:
-            kw["safe"] = kw.pop("safesearch")
-        try:
-            with Provider() as ddg:
-                for r in ddg.text(query, **kw):
-                    if not r or not r.get("href"):
-                        continue
-                    out.append({
-                        "title": (r.get("title") or "").strip(),
-                        "href": r.get("href"),
-                        "body": (r.get("body") or "").strip()
-                    })
-        except Exception as e:
-            if DEBUG_LOG: print(f"[WEB][{Provider.__module__}] erro:", e)
-        return out
-
-    # 2 rodadas
-    for _, Provider in providers:
-        res = _run(Provider)
-        if res: return res
-    for _, Provider in providers:
-        res = _run(Provider)
-        if res: return res
-    return []
 
 def web_search_raw(query: str, max_results: int = 10) -> list[dict]:
-    return _safe_ddg_text_search(query, max_results=max_results)
+    """
+    Busca via DDGS (novo pacote). Retorna [{title, href, body}].
+    """
+    try:
+        from ddgs import DDGS
+    except Exception as e:
+        if DEBUG_LOG:
+            print("[WEB] ddgs ausente:", e)
+        return []
+
+    out = []
+    try:
+        with DDGS() as ddgs:
+            for r in ddgs.text(query, region="br-pt", safesearch="moderate", max_results=max_results):
+                if not r or not r.get("href"):
+                    continue
+                out.append({
+                    "title": (r.get("title") or "").strip(),
+                    "href": r.get("href"),
+                    "body": (r.get("body") or "").strip()
+                })
+    except Exception as e:
+        if DEBUG_LOG:
+            print("[WEB][ddg] erro:", e)
+        return []
+    return out
+
+
+def _http_get(url: str, timeout: int = 10) -> str:
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; GoomihBot/1.0)"}
+        r = requests.get(url, headers=headers, timeout=timeout)
+        if 200 <= r.status_code < 300:
+            return r.text
+    except Exception as e:
+        if DEBUG_LOG:
+            print("[WEB][get] erro:", e)
+    return ""
+
+
+def _extract_readable_text(html: str) -> str:
+    """
+    Usa readability para isolar o conteúdo principal e BS4 para texto limpo.
+    """
+    if not html:
+        return ""
+    try:
+        from readability import Document
+        from bs4 import BeautifulSoup
+        doc = Document(html)
+        summary_html = doc.summary() or ""
+        soup = BeautifulSoup(summary_html, "lxml")
+        text = soup.get_text(separator=" ", strip=True)
+        text = re.sub(r"\s+", " ", text)
+        return text[:6000]
+    except Exception as e:
+        if DEBUG_LOG:
+            print("[WEB][extract] erro:", e)
+        return ""
+
+
+def _collect_page_text(url: str) -> str:
+    return _extract_readable_text(_http_get(url))
+
 
 def _keywords_from_query(q: str) -> list[str]:
-    q = (q or "").lower()
-    toks = re.findall(r"[a-záéíóúâêôãõç0-9\.-]+", q)
-    stop = {"hoje","ontem","amanha","amanhã","onde","assistir","ao","vivo","resumo","notícias","noticia"}
-    return [t for t in toks if t not in stop and len(t) >= 3]
+    ql = (q or "").lower()
+    seeds = []
+    for w in ("flamengo", "corinthians", "palmeiras", "brasileirão", "resultado",
+              "resumo", "jogo", "placar", "gols", "rodada", "estádio",
+              "maracanã", "neo química"):
+        if w in ql:
+            seeds.append(w)
+    dref = _pt_rel_date(q)
+    if dref:
+        seeds.append(dref)
+    return list(dict.fromkeys(seeds))
+
 
 def _pick_sentences_focus(text: str, query: str, max_sent: int = 5) -> list[str]:
+    """
+    Seleciona sentenças informativas (curtas/médias) com viés para eventos (placar, gols, quem/quanto/onde/quando).
+    """
     if not text:
         return []
     sents = re.split(r"(?<=[\.\!\?])\s+", text)
@@ -3421,12 +3283,12 @@ def _pick_sentences_focus(text: str, query: str, max_sent: int = 5) -> list[str]
         if not (30 <= len(st) <= 220):
             continue
         score = 0
-        if re.search(r"\b\d{1,2}\s*[x\-]\s*\d{1,2}\b", st):
+        if re.search(r"\b\d{1,2}\s*[x\-]\s*\d{1,2}\b", st):  # 2 x 1 / 4-0
             score += 5
         if re.search(r"\bminuto", st.lower()) or re.search(r"\bsegundo tempo|\bprimeiro tempo", st.lower()):
             score += 1
-        if any(kw in st.lower() for kw in ("gol","gols","virada","vitória","derrota","empate","rodada",
-                                           "pênalti","penalti","estádio","maracanã","neo química","brasileirão")):
+        if any(kw in st.lower() for kw in ("gol", "gols", "virada", "vitória", "derrota", "empate", "rodada",
+                                           "pênalti", "penalti", "estádio", "maracanã", "neo química")):
             score += 1
         for kw in seeds:
             if kw in st.lower():
@@ -3439,95 +3301,64 @@ def _pick_sentences_focus(text: str, query: str, max_sent: int = 5) -> list[str]
     scored.sort(key=lambda x: (-x[0], len(x[1])))
     return [s for _, s in scored[:max_sent]]
 
-def _extract_scoreline(title: str) -> str | None:
-    t = (title or "")
-    m = re.search(r"([A-ZÁÉÍÓÚÂÊÔÃÕÇa-z0-9\.\-\s]{2,})\s(\d{1,2})\s*[x\-]\s*(\d{1,2})\s([A-ZÁÉÍÓÚÂÊÔÃÕÇa-z0-9\.\-\s]{2,})", t)
+
+def _extract_score_hint(text: str) -> str | None:
+    m = re.search(r"([A-Za-zÀ-ÿ ]+?)\s+(\d{1,2})\s*[x\-]\s*(\d{1,2})\s+([A-Za-zÀ-ÿ ]+)", text)
     if m:
         t1, g1, g2, t2 = m.group(1).strip(), m.group(2), m.group(3), m.group(4).strip()
         return f"{t1} {g1} x {g2} {t2}"
     return None
+
 
 def _is_bad_result(item: dict) -> bool:
     title = (item.get("title") or "")
     href = (item.get("href") or "")
     if _is_opinion_like(title, href):
         return True
+    # evita páginas muito genéricas de capa
     dom = _compact_domain(href)
-    if dom in ("uol.com.br", "ge.globo.com"):
-        if not any(k in href for k in ("/jogo", "/noticia", "/futebol/", "/esporte", "/esportes", "/sport")):
-            if href.rstrip("/").lower() in (f"https://{dom}", f"http://{dom}"):
-                return True
+    if dom in ("uol.com.br", "ge.globo.com") and not any(k in href for k in ("/jogo", "/noticia", "/futebol/")):
+        return True
     return False
 
-def _rank_result(item: dict, match_mode: bool, win: tuple[date|None,date|None]) -> int:
-    """
-    Score = confiança + bônus por 'match_mode' + bônus/penalidade por data estar dentro/fora da janela.
-    """
+
+def _rank_result(item: dict, match_mode: bool) -> int:
     base = _trust_score(item["href"])
     title = (item.get("title") or "").lower()
     bonus = 0
     if match_mode:
-        if any(k in title for k in ("escalação","onde assistir","pré-jogo","pre jogo","pré jogo","ficha de jogo","ao vivo")):
+        if any(k in title for k in ("flamengo", "corinthians", "resumo", "placar", "melhores momentos", "gols")):
             bonus += 15
-        sl = _extract_scoreline(item.get("title") or "")
-        if sl: bonus += 25
-
-    # Data
-    start, end = win
-    d_item = _guess_item_date(item)
-    if start and end:
-        if d_item and (start <= d_item <= end):
-            bonus += 80  # forte preferência a itens no período correto
-        elif d_item:
-            # penaliza distância em dias
-            delta = abs((d_item - (start if d_item < start else end)).days)
-            bonus -= min(60, 10 + delta)  # mais distante -> maior penalidade
-        else:
-            bonus -= 10  # sem data detectável: pequena penalidade
+    else:
+        if any(k in title for k in ("flamengo", "notícias", "ultimas", "resumo")):
+            bonus += 8
+    # penaliza opinião
+    if _is_opinion_like(item.get("title", ""), item.get("href", "")):
+        bonus -= 25
     return -(base + bonus)
+
 
 def web_search_summarize(query_in: str, max_sources: int = 2) -> str | None:
     q_raw = (query_in or "").strip()
     if not q_raw:
         return None
 
-    # Janela de data relativa (usada para FILTRAR/ranquear)
-    win = _pt_rel_window(q_raw)  # (start, end, label)
-    start, end, _label = win
-
-    # Enriquecimento textual opcional (ajuda nos motores)
+    # Enriquecer com data relativa
     dref = _pt_rel_date(q_raw)
     q = f"{q_raw} {dref}" if dref and dref not in q_raw else q_raw
 
     match_mode = _is_match_query(q)
-    results = web_search_raw(q, max_results=16)
+    results = web_search_raw(q, max_results=12)
     if not results:
         return None
 
-    # Ordena com penalização por fora da janela
-    results.sort(key=lambda it: _rank_result(it, match_mode, (start, end)))
-
-    # Filtra lixo/duplicatas e respeita janela quando possível
-    filtered = []
-    seen_urls = set()
-    for r in results:
-        if _is_bad_result(r):
-            continue
-        u = r.get("href")
-        if not u or u in seen_urls:
-            continue
-        d_item = _guess_item_date(r)
-        if start and end and d_item:
-            if not (start <= d_item <= end):
-                continue  # fora da janela -> corta
-        seen_urls.add(u)
-        filtered.append(r)
-
-    # fallback brando: se ficamos sem nada, pega top 3 originais (ainda assim ranqueados)
+    # ordenar + filtrar
+    results.sort(key=lambda it: _rank_result(it, match_mode))
+    filtered = [r for r in results if not _is_bad_result(r)]
     if not filtered:
         filtered = results[:3]
 
-    # Coleta 1–2 textos de domínios distintos
+    # coletar 1–2 textos reais de domínios distintos
     texts, fontes, used_domains = [], [], set()
     for r in filtered:
         url = r["href"]
@@ -3535,10 +3366,16 @@ def web_search_summarize(query_in: str, max_sources: int = 2) -> str | None:
         if dom in used_domains:
             continue
         used_domains.add(dom)
-        snippet = (r.get("body") or r.get("title") or "").strip()
-        if snippet:
-            texts.append(snippet)
-            fontes.append(f"{dom} — {url}")
+        txt = _collect_page_text(url)
+        if not txt:
+            # fallback: snippet do DDG, mas limpo e curto
+            sn = (r.get("body") or r.get("title") or "").strip()
+            sn = re.sub(r"\s+", " ", sn)
+            txt = sn[:500]
+        if not txt:
+            continue
+        texts.append(txt)
+        fontes.append(f"{dom} — {url}")
         if len(texts) >= max_sources:
             break
 
@@ -3546,35 +3383,51 @@ def web_search_summarize(query_in: str, max_sources: int = 2) -> str | None:
         return None
 
     joined = " ".join(texts)
+
     if match_mode:
-        linhas = ["Resumo (busca na web):"]
-        bullets = _pick_sentences_focus(joined, q, max_sent=3) or []
-        for r in filtered[:3]:
-            sl = _extract_scoreline(r.get("title") or "")
-            if sl and all(sl not in b for b in bullets):
-                bullets.insert(0, sl)
-                break
-        for b in bullets[:3]:
+        # TEMPLATE — resumo de jogo
+        score = _extract_score_hint(joined)
+        bullets = _pick_sentences_focus(joined, q, max_sent=4)
+        # Tenta puxar competição/estádio
+        comp = None
+        est = None
+        m_comp = re.search(r"(Brasileir[aã]o|Copa do Brasil|Libertadores|Sul[- ]Americana)", joined, re.IGNORECASE)
+        if m_comp:
+            comp = m_comp.group(1)
+        if "maracanã" in joined.lower():
+            est = "Maracanã"
+        elif "neo química" in joined.lower():
+            est = "Neo Química Arena"
+
+        linhas = []
+        linhas.append("Resumo do jogo (busca na web):")
+        if score:
+            extra = f" ({comp}, {est})" if (comp or est) else ""
+            linhas.append(f"- Placar: {score}{extra}")
+        for b in bullets:
             linhas.append(f"- {b}")
+        # fontes enxutas (só 1)
         fontes_txt = "\nFonte: " + "; ".join(fontes[:1]) if fontes else ""
         return "\n".join(linhas) + fontes_txt
+
     else:
+        # TEMPLATE — notícias gerais (3 bullets)
         bullets = _pick_sentences_focus(joined, q, max_sent=3)
         if not bullets:
+            # fallback: usa títulos/snippets limpos
             for r in filtered[:3]:
                 sn = (r.get("body") or r.get("title") or "").strip()
                 sn = re.sub(r"\s+", " ", sn)
                 if sn:
                     bullets.append(sn[:220])
             bullets = bullets[:3]
+
         linhas = ["Resumo (busca na web):"]
         for b in bullets[:3]:
             linhas.append(f"- {b}")
         fontes_txt = "\nFonte: " + "; ".join(fontes[:1]) if fontes else ""
         return "\n".join(linhas) + fontes_txt
-
 # ==== /14B) FIM ====
-
 
 # ==== 15) Inicialização ======================================================
 if __name__ == "__main__":
