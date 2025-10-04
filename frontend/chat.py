@@ -67,7 +67,7 @@ DEFAULT_QUICK = {
         "Curiosidades de biologia",
     ],
     "helena": [
-        "Liste minhas últimas consultas (Helena)",
+        "Liste minhas últimas consultas",
         "Resumo das notícias do dia",
         "Dicas de receitas para o jantar",
         "Como está a previsão do tempo hoje?",
@@ -400,31 +400,96 @@ def _try_render_projections(raw: str) -> str | None:
         if not m:
             continue
         casa, fora, trail = m.group("casa"), m.group("fora"), m.group("trail")
+        # Só considera LINHAS que tenham algum marcador REAL de projeção
+        mu = re_under.search(trail)
+        md = re_dc.search(trail)
+        ma = re_avg.search(trail)
+        mp = re_pct_u35.search(trail)
+
+        matched_any = any([mu, md, ma, mp])
+        if not matched_any:
+            continue  # evita engolir Over 1,5 ou outros textos
+
         jogo = f"{casa} x {fora}"
         u35_flag = "—"; u35_conf = "—"; dc_lab = "—"; dc_conf = "—"; avg_g = "—"; pct_u35 = "—"
-        mu = re_under.search(trail)
+
         if mu:
             u35_flag = "✅" if mu.group("ok") == "✅" else "❌"
             u35_conf = f"{mu.group('pct')}%"
-        md = re_dc.search(trail)
         if md:
             dc_lab  = f"{md.group('label')} ({md.group('team')})"
             dc_conf = f"{md.group('pct')}%"
-        ma = re_avg.search(trail)
         if ma:
             avg_g = ma.group("avg").replace(",", ".")
-        mp = re_pct_u35.search(trail)
         if mp:
             pct_u35 = f"{mp.group('pct')}%"
+
         rows.append([jogo, u35_flag, u35_conf, dc_lab, dc_conf, avg_g, pct_u35])
 
     if not rows:
         return None
     return _mk_table_html(headers, rows)
 
+def _try_render_over15(raw: str) -> str | None:
+    """
+    Renderiza a saída do endpoint Over 1,5 (bloco markdown gerado pelo backend).
+    Exemplo de linha:
+    - Time A x Time B — conf 72% (H 80% • A 64% • H2H 55%)
+    """
+    lines = [l.strip() for l in raw.splitlines() if l.strip()]
+    rows: list[list[str]] = []
+
+    # Captura: " - Casa x Fora — conf NN% (H NN% • A NN% • H2H NN%) "
+    import re
+    pat = re.compile(
+        r"^\-\s*(?P<casa>.+?)\s+x\s+(?P<fora>.+?)\s+[—-]\s+conf\s+(?P<conf>\d{1,3})%\s*\("
+        r".*?H\s+(?P<h>\d{1,3})%.*?A\s+(?P<a>\d{1,3})%.*?H2H\s+(?P<h2h>\d{1,3})%\s*\)",
+        re.IGNORECASE
+    )
+    # Sinal fraco de que este bloco é de Over 1,5 (ajuda a evitar falso-positivo)
+    looks_over = any(re.search(r"(?i)\bover\s*1[.,]?\s*5\b", l) for l in lines[:3])
+
+    for l in lines:
+        m = pat.search(l)
+        if not m:
+            continue
+        casa = m.group("casa").strip()
+        fora = m.group("fora").strip()
+        conf = f"{m.group('conf')}%"
+        h    = f"{m.group('h')}%"
+        a    = f"{m.group('a')}%"
+        h2h  = f"{m.group('h2h')}%"
+        rows.append([f"{casa} x {fora}", conf, h, a, h2h])
+
+    if not rows:
+        # se não casou nada, não renderiza como Over (deixa outros renderers tentarem)
+        return None if not looks_over else None
+
+    headers = [
+        "Partida",
+        "Prob. Over 1,5",
+        "Mand: % Over(últ.5)",
+        "Visit: % Over(últ.5)",
+        "H2H: % Over(últ.5)",
+    ]
+    html = _mk_table_html(headers, rows)
+
+    legend = (
+        "<div style='font-size:12px;opacity:.75;margin-top:6px'>"
+        "Over 1,5 = total de gols na partida ≥ 2. "
+        "Percentuais calculados com base nos últimos 5 jogos de cada time e nos últimos 5 confrontos diretos."
+        "</div>"
+    )
+    return html + legend
+
+
 def try_render_football_pretty(raw: str) -> bool:
     html = _try_render_fixtures(raw)
     if not html:
+        # primeiro tenta Over 1,5
+        html = _try_render_over15(raw)
+    if not html:
+        # se não for Over, tenta Projeções (Under/DC)
         html = _try_render_projections(raw)
     if not html:
         return False
@@ -436,6 +501,7 @@ def try_render_football_pretty(raw: str) -> bool:
         unsafe_allow_html=True,
     )
     return True
+
 
 # ---------- Formatação genérica para respostas "cruas" do Goomih ----------
 def _looks_markdownish(txt: str) -> bool:
