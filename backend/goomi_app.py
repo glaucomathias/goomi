@@ -1776,6 +1776,133 @@ def formatar_resposta_projecoes(proj_payload: Dict[str, Any]) -> str:
     linhas.append("\nObs.: estimativa estatística (não garante resultado).")
     return "\n".join(linhas)
 
+# ==== 10X) Utils — Over 1,5 (métricas recentes + H2H) ========================
+
+_over15_norm_names = {
+    "mls": ["mls", "major league soccer", "usa mls", "eua mls", "estados unidos mls"],
+    "saudi pro league": ["saudi pro league", "árabia saudita", "arabia saudita", "saudi", "saudí", "pro league saudita", "saudi league"]
+}
+
+def _normalize_league_hint(txt: str) -> str:
+    t = (txt or "").strip().lower()
+    for canon, alts in _over15_norm_names.items():
+        if t == canon or any(a in t for a in alts):
+            return canon
+    return t
+
+# IDs diretos para as ligas mais pedidas (evita falha de alias no resolver global)
+_OVER15_LEAGUE_IDS = {
+    # MLS
+    "mls": 253,
+    "major league soccer": 253,
+    "usa mls": 253, "eua mls": 253, "estados unidos mls": 253,
+    # Saudi Pro League
+    "saudi pro league": 307,
+    "árabia saudita": 307, "arabia saudita": 307,
+    "saudi": 307, "saudí": 307, "pro league saudita": 307, "saudi league": 307,
+}
+
+def _hint_to_league_id(hint: str) -> Optional[int]:
+    """Resolve texto (ou número) de liga para o ID da API-Football.
+       Tenta: número direto -> mapa fixo -> resolver global fb_search_league_id."""
+    h = (hint or "").strip().lower()
+    if not h:
+        return None
+    if h.isdigit():
+        return int(h)
+    canon = _normalize_league_hint(h)
+    if canon in _OVER15_LEAGUE_IDS:
+        return _OVER15_LEAGUE_IDS[canon]
+    try:
+        return fb_search_league_id(canon)
+    except Exception:
+        return None
+
+def _safe_num(x, default=0.0):
+    try:
+        return float(x)
+    except:
+        return float(default)
+
+def _match_goals_total(m):
+    # API-Football: tenta ler goals/home+away (com fallback para score.fulltime)
+    try:
+        gh = _safe_num(m.get("goals", {}).get("home", 0))
+        ga = _safe_num(m.get("goals", {}).get("away", 0))
+        if gh == 0 and ga == 0:
+            gh = _safe_num(m.get("score", {}).get("fulltime", {}).get("home", 0))
+            ga = _safe_num(m.get("score", {}).get("fulltime", {}).get("away", 0))
+        return gh + ga
+    except:
+        return 0.0
+
+def _pct_over15(matches):
+    if not matches:
+        return 0.0
+    overs = 0
+    for m in matches:
+        if _match_goals_total(m) >= 2.0:
+            overs += 1
+    return overs / max(1, len(matches))
+
+def _avg_team_for_against(matches, team_id: int):
+    """médias do time: gols feitos, sofridos e total por partida nos últimos N jogos"""
+    if not matches:
+        return 0.0, 0.0, 0.0
+    gf, ga, tot = 0.0, 0.0, 0.0
+    for m in matches:
+        gh = _safe_num(m.get("goals", {}).get("home", 0))
+        ga_ = _safe_num(m.get("goals", {}).get("away", 0))
+        home_id = (m.get("teams", {}) or {}).get("home", {}).get("id")
+        away_id = (m.get("teams", {}) or {}).get("away", {}).get("id")
+        if str(home_id) == str(team_id):
+            gf += gh; ga += ga_
+        elif str(away_id) == str(team_id):
+            gf += ga_; ga += gh
+        tot += (gh + ga_)
+    n = max(1, len(matches))
+    return gf/n, ga/n, tot/n
+
+def _over15_conf_from_signals(h_last, a_last, h2h_last_matches, home_id, away_id, is_home=True):
+    # Sinais (médias e % de over)
+    h_gf, h_ga, h_tot = _avg_team_for_against(h_last, home_id)
+    a_gf, a_ga, a_tot = _avg_team_for_against(a_last, away_id)
+    p_over_h = _pct_over15(h_last)
+    p_over_a = _pct_over15(a_last)
+    p_over_h2h = _pct_over15(h2h_last_matches)
+
+    # combinação robusta (0–1): último desempenho pesa mais que H2H
+    base = 0.45 * p_over_h + 0.45 * p_over_a + 0.10 * p_over_h2h
+
+    # booster por expectativa de gols (marcam + um pouco do que sofrem)
+    exp_tot = h_gf + a_gf + 0.5*(h_ga + a_ga)
+    booster = max(-0.05, min(0.15, (exp_tot - 2.0) * 0.15))
+
+    # leve ajuste de mando
+    home_adj = 0.03 if is_home else 0.0
+
+    conf = base + booster + home_adj
+    return max(0.0, min(0.99, conf))
+
+def _when_to_date_over15(when_text: str):
+    """aceita: hoje / amanha / amanhã / ontem / YYYY-MM-DD → retorna datetime.date"""
+    wt = (when_text or "").strip().lower()
+    if wt in ("", "hoje", "today"):
+        return _today()
+    if wt in ("amanha", "amanhã", "tomorrow"):
+        return _tomorrow()
+    if wt in ("ontem", "yesterday"):
+        return _yesterday()
+    # YYYY-MM-DD
+    try:
+        from datetime import datetime as _dt
+        return _dt.strptime(wt, "%Y-%m-%d").date()
+    except Exception:
+        return _today()
+
+# ==== /10X) ===================================================================
+
+
 # ==== 11A) Jogos óbvios (novo modelo) =======================================
 def _obv_make_strength(stats_home: Dict[str, Any], stats_away: Dict[str, Any], h2h: Optional[Dict[str, Any]]=None):
     """
@@ -1898,6 +2025,185 @@ def obvious_games_calc(date_str: Optional[str]=None,
         "table_markdown": _obv_format_table(table_rows),
         "notes": "Heurística rápida: form vs defesa + bônus leve de H2H. Strength 0..1."
     }
+
+# ==== 11C) Football — Over 1,5 gols (API-Football) ===========================
+
+@app.get("/v1/football/over15")
+def football_over15():
+    """
+    Exemplos:
+      /v1/football/over15?league=mls&when=hoje&min_conf=0.65&last=5&h2h_last=5&limit=12
+      /v1/football/over15?league=saudi%20pro%20league&when=amanha
+      /v1/football/over15?league=premier%20league&when=2025-10-04
+    """
+    if not SPORTS_ENABLED or not SPORTS_KEY:
+        return jsonify({"error": "sports desabilitado ou sem API key"}), 400
+
+    league_q = request.args.get("league", "").strip()
+    league_norm = _normalize_league_hint(league_q)
+    when_q = request.args.get("when", "hoje")
+    date_obj = _when_to_date_over15(when_q)
+
+    min_conf = _safe_num(request.args.get("min_conf", 0.65))
+    last_n = int(request.args.get("last", 5))
+    h2h_n = int(request.args.get("h2h_last", 5))
+    limit = int(request.args.get("limit", 12))
+
+    # aceitar múltiplas ligas separadas por vírgula
+    league_hints = [x.strip() for x in (league_norm or "").split(",") if x.strip()]
+    if not league_hints:
+        # default: MLS + Saudi Pro League (prioridades do Glauco)
+        league_hints = ["mls", "saudi pro league"]
+
+    results_all = []
+
+    # -------- helper interno para extrair times de forma robusta --------
+    def _extract_home_away(fx: dict):
+        """Retorna (home_id, away_id, home_name, away_name) ou (None, None, '', '')."""
+        home_id = away_id = None
+        home_name = away_name = ""
+
+        teams = fx.get("teams")
+        if isinstance(teams, dict):
+            h = teams.get("home") or {}
+            a = teams.get("away") or {}
+            if isinstance(h, dict):
+                home_id = h.get("id") or h.get("team_id")
+                home_name = (h.get("name") or h.get("team_name") or "")[:64]
+            if isinstance(a, dict):
+                away_id = a.get("id") or a.get("team_id")
+                away_name = (a.get("name") or a.get("team_name") or "")[:64]
+        elif isinstance(teams, list) and len(teams) >= 1:
+            # algumas respostas podem vir como lista; tenta inferir home/away
+            h = next((t for t in teams if isinstance(t, dict) and t.get("home") is True), None)
+            a = next((t for t in teams if isinstance(t, dict) and t.get("home") is False), None)
+            if not h and isinstance(teams[0], dict):
+                h = teams[0]
+            if not a and len(teams) >= 2 and isinstance(teams[1], dict):
+                a = teams[1]
+            if h:
+                home_id = h.get("id") or h.get("team_id")
+                home_name = (h.get("name") or h.get("team_name") or "")[:64]
+            if a:
+                away_id = a.get("id") or a.get("team_id")
+                away_name = (a.get("name") or a.get("team_name") or "")[:64]
+
+        # chaves alternativas (algumas libs mapeiam assim)
+        if not home_id:
+            alt_h = fx.get("home") or fx.get("homeTeam") or fx.get("home_team") or {}
+            if isinstance(alt_h, dict):
+                home_id = alt_h.get("id") or alt_h.get("team_id")
+                home_name = home_name or (alt_h.get("name") or alt_h.get("team_name") or "")
+        if not away_id:
+            alt_a = fx.get("away") or fx.get("awayTeam") or fx.get("away_team") or {}
+            if isinstance(alt_a, dict):
+                away_id = alt_a.get("id") or alt_a.get("team_id")
+                away_name = away_name or (alt_a.get("name") or alt_a.get("team_name") or "")
+
+        return home_id, away_id, home_name, away_name
+
+    for hint in league_hints:
+        # resolver id da liga (texto ou id numérico direto) com fallback de aliases fixos
+        league_id = _hint_to_league_id(hint)
+
+        if not league_id:
+            results_all.append({"league": hint, "error": "liga não encontrada"})
+            continue
+
+        # jogos do dia
+        fixtures = fb_fixtures_by_league_date(league_id, date_obj)
+
+        # normaliza para lista
+        if isinstance(fixtures, dict) and isinstance(fixtures.get("response"), list):
+            fixtures_list = fixtures.get("response") or []
+        elif isinstance(fixtures, list):
+            fixtures_list = fixtures
+        else:
+            fixtures_list = []
+
+        # tenta nome da liga a partir do primeiro fixture
+        league_name = None
+        try:
+            if fixtures_list:
+                league_name = (fixtures_list[0].get("league") or {}).get("name")
+        except Exception:
+            pass
+        league_name = league_name or str(league_id)
+
+        for fx in fixtures_list:
+            try:
+                home_id, away_id, home_name, away_name = _extract_home_away(fx)
+                if not home_id or not away_id:
+                    continue
+
+                # últimos jogos dos times
+                h_last = fb_fixtures_last_n(home_id, last_n)
+                a_last = fb_fixtures_last_n(away_id, last_n)
+                # H2H recente
+                h2h = fb_headtohead(home_id, away_id, h2h_n)
+
+                # confiança Over 1,5
+                conf = _over15_conf_from_signals(h_last, a_last, h2h, home_id, away_id, is_home=True)
+                if conf < min_conf:
+                    continue
+
+                # métricas para exibir
+                p_over_h = round(100 * _pct_over15(h_last))
+                p_over_a = round(100 * _pct_over15(a_last))
+                p_over_h2h = round(100 * _pct_over15(h2h))
+
+                gf_h, ga_h, tot_h = _avg_team_for_against(h_last, home_id)
+                gf_a, ga_a, tot_a = _avg_team_for_against(a_last, away_id)
+
+                results_all.append({
+                    "league": league_name,
+                    "date": date_obj.isoformat(),
+                    "home": home_name,
+                    "away": away_name,
+                    "confidence": round(conf, 3),
+                    "signals": {
+                        "pct_over15_home_last": p_over_h,
+                        "pct_over15_away_last": p_over_a,
+                        "pct_over15_h2h": p_over_h2h,
+                        "avg_home": {"gf": round(gf_h, 2), "ga": round(ga_h, 2), "tot": round(tot_h, 2)},
+                        "avg_away": {"gf": round(gf_a, 2), "ga": round(ga_a, 2), "tot": round(tot_a, 2)}
+                    }
+                })
+            except Exception:
+                # não derruba a lista por um fixture com formato inesperado
+                continue
+
+    # ordenar por confiança desc e limitar
+    results_all.sort(key=lambda x: x.get("confidence", 0), reverse=True)
+    if limit > 0:
+        results_all = results_all[:limit]
+
+    # markdown enxuto para o chat
+    if results_all:
+        lines = [f"**Over 1,5 — {date_obj.isoformat()}**"]
+        cur_league = None
+        for r in results_all:
+            if r["league"] != cur_league:
+                cur_league = r["league"]
+                lines.append(f"\n__{cur_league}__")
+            lines.append(
+                f"- {r['home']} x {r['away']} — conf {int(100 * r['confidence'])}% "
+                f"(H {r['signals']['pct_over15_home_last']}% | A {r['signals']['pct_over15_away_last']}% | H2H {r['signals']['pct_over15_h2h']}%)"
+            )
+        table_md = "\n".join(lines)
+    else:
+        table_md = f"Sem jogos acima de {int(100 * min_conf)}% para {date_obj.isoformat()}."
+
+    return jsonify({
+        "ok": True,
+        "date": date_obj.isoformat(),
+        "min_conf": min_conf,
+        "results": results_all,
+        "table_markdown": table_md
+    })
+
+# ==== /11C) ===================================================================
+
 
 # ==== 12) Responder Esportes (por time) =====================================
 def responder_esporte(team: str, action: str, date_str: Optional[str], last_n: Optional[int]=None) -> Optional[str]:
@@ -2467,6 +2773,48 @@ def ask():
             q_busca = (question.split(":",1)[1] or "").strip() if ":" in question else question
             summary = web_search_summarize(q_busca, max_sources=4)
             answer = summary or "Não achei conteúdo confiável agora. Quer refinar a busca (ex.: incluir palavra-chave principal e um site)?"
+            memory.chat_memory.add_user_message(question)
+            memory.chat_memory.add_ai_message(answer)
+            return jsonify({"answer": answer})
+
+        # [ASK-OVER15] consulta natural "over 1,5" (qualquer liga suportada pela API)
+        if re.search(r"\bover\s*1[\.,]?\s*5\b|\bacima\s*de\s*1[\.,]?\s*5\b|\b\+?\s*1[\.,]?\s*5\s*gols\b", ql):
+            # tenta reconhecer uma liga mencionada no texto
+            liga_hint = None
+            for canon, alts in _over15_norm_names.items():
+                if canon in ql or any(a in ql for a in alts):
+                    liga_hint = canon
+                    break
+
+            # fallback textual: "liga <nome> ..." (sem arrastar 'hoje/amanhã/ontem')
+            m_liga = re.search(r"liga\s+([a-zA-Z0-9\s\-]+)", ql)
+            if m_liga:
+                liga_raw = m_liga.group(1).strip()
+                liga_raw = re.split(r"\b(hoje|amanh[ãa]|ontem|de\s+hoje|de\s+amanh[ãa])\b", liga_raw)[0].strip()
+                if liga_raw:
+                    liga_hint = liga_hint or liga_raw
+
+            # fallback: padrão MLS + Saudi Pro se não vier liga
+            liga_qs = liga_hint or ""
+
+
+            # quando: hoje/amanhã
+            when_hint = "hoje"
+            if ("amanhã" in ql) or ("amanha" in ql):
+                when_hint = "amanha"
+            elif "ontem" in ql:
+                when_hint = "ontem"
+
+            # chama o endpoint interno sem sair do processo
+            with app.test_request_context(f"/v1/football/over15?league={liga_qs}&when={when_hint}"):
+                resp = football_over15()
+            try:
+                data = resp.get_json() if hasattr(resp, "get_json") else (resp[0].get_json() if isinstance(resp, tuple) else {})
+            except Exception:
+                data = {}
+
+            md = data.get("table_markdown", "Não encontrei jogos com confiança suficiente.")
+            answer = f"Over 1,5 (esportes):\n\n{md}"
             memory.chat_memory.add_user_message(question)
             memory.chat_memory.add_ai_message(answer)
             return jsonify({"answer": answer})
