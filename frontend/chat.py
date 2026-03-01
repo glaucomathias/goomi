@@ -7,6 +7,7 @@ import hashlib
 from collections import Counter
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 from datetime import datetime, date
 
 # =========================
@@ -25,7 +26,9 @@ st.set_page_config(page_title=PAGE_TITLE, page_icon=PAGE_ICON, layout="wide")
 # Padrão QA: 127.0.0.1:5000. Em produção, GOOMI_API_BASE é definido via /etc/goomi.env
 API_BASE   = os.getenv("GOOMI_API_BASE", "http://127.0.0.1:5000")
 ASK_URL    = f"{API_BASE}/ask"
-HEALTH_URL = f"{API_BASE}/health"
+UPLOAD_URL = f"{API_BASE}/upload"
+UPLOADS_URL = f"{API_BASE}/uploads"
+# TRANSCRIBE_URL não é mais usado (voz transcreve via OpenAI no frontend)
 
 APP_NAME   = "Goomih"
 SUBTITLE   = "Assistente virtual da nossa família"
@@ -38,41 +41,52 @@ USERS = {
     "giovanna":  {"label": "Giovanna",  "avatar": "😊", "color": "pink"},
     "helena":    {"label": "Helena",    "avatar": "😊", "color": "pink"},
     "glauco":    {"label": "Glauco",    "avatar": "😎", "color": "blue"},
+    "rayane":   {"label": "Rayane",   "avatar": "😊", "color": "pink"},
 }
 
 # ====== Perguntas rápidas (por usuário) ======
 DEFAULT_QUICK = {
+    # Pais (cadastro / gestão)
     "glauco": [
-        "Quais são os jogos da Série B hoje?",
-        "Faça as projeções da Série B",
-        "Quero as projeções da Série B do dia 30/08/2025",
-        "Liste minhas últimas consultas (Helena)",
-    ],
-    "guilherme": [
-        "Quais são os melhores animes?",
-        "Quais são os melhores jogos do ano?",
-        "Quais são as notícias de tecnologia?",
-        "Mostre curiosidades de ciência",
-    ],
-    "giulia": [
-        "Me conte uma curiosidade legal!",
-        "Ideias de filmes para assistir em família",
-        "Qual é a capital de cada estado do Brasil?",
-        "Explique frações de forma simples",
-    ],
-    "giovanna": [
-        "Dicas para organizar os estudos",
-        "Me ajude com um resumo de história",
-        "Filmes/series de suspense recomendados",
-        "Curiosidades de biologia",
+        "Manual escola",
+        "Giulia tem aula de que amanhã?",
+        "Agenda escolar da Giulia esse mês",
+        "Notas da Giulia no 1B",
     ],
     "helena": [
-        "Liste minhas últimas consultas",
-        "Resumo das notícias do dia",
-        "Dicas de receitas para o jantar",
-        "Como está a previsão do tempo hoje?",
+        "Manual escola",
+        "Giovanna tem aula de que hoje?",
+        "Agenda escolar da Giovanna esse mês",
+        "Notas da Giovanna no 1B",
+    ],
+    "rayane": [
+        "Manual escola",
+        "Giulia tem aula de que hoje?",
+        "Agenda escolar da Giulia esse mês",
+        "Notas da Giulia no 1B",
+    ],
+
+    # Crianças (leitura + estudo)
+    "giulia": [
+        "Que aula a Giulia tem hoje?",
+        "Que aula a Giulia tem amanhã?",
+        "Mostra a grade semanal da Giulia",
+        "Me ajuda a estudar matemática (explica bem simples)",
+    ],
+    "giovanna": [
+        "Que aula a Giovanna tem hoje?",
+        "Que aula a Giovanna tem amanhã?",
+        "Mostra a grade semanal da Giovanna",
+        "Me ajuda a estudar português (explica bem simples)",
+    ],
+    "guilherme": [
+        "Que aula o Guilherme tem hoje?",
+        "Que aula o Guilherme tem amanhã?",
+        "Mostra a grade semanal do Guilherme",
+        "Me ajuda a estudar ciências (explica bem simples)",
     ],
 }
+
 QUICK_STATS_PATH = os.path.join(BASE_DIR, "quick_stats.json")
 
 def _load_quick_stats() -> dict:
@@ -219,20 +233,30 @@ div[role="combobox"] {{
 </style>
 """, unsafe_allow_html=True)
 
+
+
+def upload_to_backend(file_bytes: bytes, filename: str, description: str) -> dict:
+    try:
+        files = {"file": (filename, file_bytes)}
+        data = {"client_id": st.session_state.client_id, "description": description or ""}
+        r = requests.post(UPLOAD_URL, files=files, data=data, timeout=180)
+        if r.ok:
+            return r.json()
+        return {"ok": False, "error": f"Erro {r.status_code}: {r.text}"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 # =========================
 # Utils
 # =========================
-def api_health_ok() -> bool:
-    try:
-        r = requests.get(HEALTH_URL, timeout=4)
-        return r.ok
-    except Exception:
-        return False
 
 def ask_backend(question: str) -> str:
+    ql = (question or "").strip().lower()
+
     payload = {"client_id": st.session_state.client_id, "question": question}
     try:
-        r = requests.post(ASK_URL, json=payload, timeout=60)
+        r = requests.post(ASK_URL, json=payload, timeout=120)
         if r.ok:
             return r.json().get("answer", "(sem resposta)")
         return f"Erro {r.status_code} - {r.text}"
@@ -347,162 +371,6 @@ def render_grades_table_if_possible(raw: str) -> str | None:
         lines.append(f"| {subj} | {p1} | {p2} | {media} |")
     return "\n".join(lines)
 
-# ---------- FUTEBOL (tabelas jogos/projeções) ----------
-def _mk_table_html(headers, rows):
-    th = "".join(
-        f"<th style='padding:8px 10px;border-bottom:1px solid #e5e7eb;text-align:left'>{h}</th>"
-        for h in headers
-    )
-    trs = []
-    for r in rows:
-        tds = "".join(
-            f"<td style='padding:8px 10px;border-bottom:1px solid #f1f5f9'>{c}</td>" for c in r
-        )
-        trs.append(f"<tr>{tds}</tr>")
-    return (
-        "<div style='overflow-x:auto'>"
-        "<table style='border-collapse:collapse;min-width:560px'>"
-        f"<thead><tr>{th}</tr></thead>"
-        f"<tbody>{''.join(trs)}</tbody>"
-        "</table></div>"
-    )
-
-def _try_render_fixtures(raw: str) -> str | None:
-    lines = [l.strip("•- ").strip() for l in raw.splitlines() if l.strip()]
-    rows = []
-    pat = re.compile(
-        r"^(?P<casa>.+?)\s+vs\s+(?P<fora>.+?)\s+[—-]\s+(?P<camp>.+?)\s+[—-]\s+(?P<data>\d{2}/\d{2}/\d{4})\s+(?P<hora>\d{2}:\d{2})$",
-        re.IGNORECASE
-    )
-    for l in lines:
-        m = pat.search(l)
-        if not m:
-            continue
-        d = m.groupdict()
-        rows.append([d["data"], d["camp"], d["casa"], d["fora"], d["hora"]])
-    if not rows:
-        return None
-    headers = ["Data", "Campeonato", "Casa", "Visitante", "Hora"]
-    return _mk_table_html(headers, rows)
-
-def _try_render_projections(raw: str) -> str | None:
-    lines = [l.strip("•- ").strip() for l in raw.splitlines() if l.strip()]
-    rows = []
-    headers = ["Jogo", "U3.5", "Conf. U3.5", "Dupla chance", "Conf. DC", "Gols médios", "%U3.5"]
-    head_pat = re.compile(r"^(?P<casa>.+?)\s+x\s+(?P<fora>.+?)\s+[—-]\s+(?P<trail>.+)$", re.IGNORECASE)
-    re_under   = re.compile(r"Under\s*3\.5\s*(?P<ok>✅|❌)\s*\((?P<pct>\d{1,3})%\)", re.IGNORECASE)
-    re_dc      = re.compile(r"Dupla\s+chance(?:\s+sugerida)?\s*:\s*(?P<label>1X|X2)\s*\((?P<team>[^)]+)\)\s*\((?P<pct>\d{1,3})%\)", re.IGNORECASE)
-    re_avg     = re.compile(r"gols\s*m[eé]dios.*?:\s*(?P<avg>\d+(?:[.,]\d+)?)", re.IGNORECASE)
-    re_pct_u35 = re.compile(r"%Under3\.5.*?:\s*(?P<pct>\d{1,3})%", re.IGNORECASE)
-
-    for l in lines:
-        m = head_pat.search(l)
-        if not m:
-            continue
-        casa, fora, trail = m.group("casa"), m.group("fora"), m.group("trail")
-        # Só considera LINHAS que tenham algum marcador REAL de projeção
-        mu = re_under.search(trail)
-        md = re_dc.search(trail)
-        ma = re_avg.search(trail)
-        mp = re_pct_u35.search(trail)
-
-        matched_any = any([mu, md, ma, mp])
-        if not matched_any:
-            continue  # evita engolir Over 1,5 ou outros textos
-
-        jogo = f"{casa} x {fora}"
-        u35_flag = "—"; u35_conf = "—"; dc_lab = "—"; dc_conf = "—"; avg_g = "—"; pct_u35 = "—"
-
-        if mu:
-            u35_flag = "✅" if mu.group("ok") == "✅" else "❌"
-            u35_conf = f"{mu.group('pct')}%"
-        if md:
-            dc_lab  = f"{md.group('label')} ({md.group('team')})"
-            dc_conf = f"{md.group('pct')}%"
-        if ma:
-            avg_g = ma.group("avg").replace(",", ".")
-        if mp:
-            pct_u35 = f"{mp.group('pct')}%"
-
-        rows.append([jogo, u35_flag, u35_conf, dc_lab, dc_conf, avg_g, pct_u35])
-
-    if not rows:
-        return None
-    return _mk_table_html(headers, rows)
-
-def _try_render_over15(raw: str) -> str | None:
-    """
-    Renderiza a saída do endpoint Over 1,5 (bloco markdown gerado pelo backend).
-    Exemplo de linha:
-    - Time A x Time B — conf 72% (H 80% • A 64% • H2H 55%)
-    """
-    lines = [l.strip() for l in raw.splitlines() if l.strip()]
-    rows: list[list[str]] = []
-
-    # Captura: " - Casa x Fora — conf NN% (H NN% • A NN% • H2H NN%) "
-    import re
-    pat = re.compile(
-        r"^\-\s*(?P<casa>.+?)\s+x\s+(?P<fora>.+?)\s+[—-]\s+conf\s+(?P<conf>\d{1,3})%\s*\("
-        r".*?H\s+(?P<h>\d{1,3})%.*?A\s+(?P<a>\d{1,3})%.*?H2H\s+(?P<h2h>\d{1,3})%\s*\)",
-        re.IGNORECASE
-    )
-    # Sinal fraco de que este bloco é de Over 1,5 (ajuda a evitar falso-positivo)
-    looks_over = any(re.search(r"(?i)\bover\s*1[.,]?\s*5\b", l) for l in lines[:3])
-
-    for l in lines:
-        m = pat.search(l)
-        if not m:
-            continue
-        casa = m.group("casa").strip()
-        fora = m.group("fora").strip()
-        conf = f"{m.group('conf')}%"
-        h    = f"{m.group('h')}%"
-        a    = f"{m.group('a')}%"
-        h2h  = f"{m.group('h2h')}%"
-        rows.append([f"{casa} x {fora}", conf, h, a, h2h])
-
-    if not rows:
-        # se não casou nada, não renderiza como Over (deixa outros renderers tentarem)
-        return None if not looks_over else None
-
-    headers = [
-        "Partida",
-        "Prob. Over 1,5",
-        "Mand: % Over(últ.5)",
-        "Visit: % Over(últ.5)",
-        "H2H: % Over(últ.5)",
-    ]
-    html = _mk_table_html(headers, rows)
-
-    legend = (
-        "<div style='font-size:12px;opacity:.75;margin-top:6px'>"
-        "Over 1,5 = total de gols na partida ≥ 2. "
-        "Percentuais calculados com base nos últimos 5 jogos de cada time e nos últimos 5 confrontos diretos."
-        "</div>"
-    )
-    return html + legend
-
-
-def try_render_football_pretty(raw: str) -> bool:
-    html = _try_render_fixtures(raw)
-    if not html:
-        # primeiro tenta Over 1,5
-        html = _try_render_over15(raw)
-    if not html:
-        # se não for Over, tenta Projeções (Under/DC)
-        html = _try_render_projections(raw)
-    if not html:
-        return False
-    st.markdown(
-        "<div class='center-wrap'><div class='shadow-card' style='text-align:left'>"
-        "<b>Aqui está organizado:</b><br><br>"
-        f"{html}"
-        "</div></div>",
-        unsafe_allow_html=True,
-    )
-    return True
-
-
 # ---------- Formatação genérica para respostas "cruas" do Goomih ----------
 def _looks_markdownish(txt: str) -> bool:
     """Heurística simples para não retrabalhar textos já em Markdown rico (ex.: OpenAI)."""
@@ -570,92 +438,6 @@ def format_goomi_plaintext(raw: str) -> str | None:
 
     return None
 
-# ---------- Consultas Médicas (Helena) – formatação no front ----------
-def _parse_iso(dtxt: str) -> date | None:
-    try:
-        return datetime.strptime(dtxt.strip(), "%Y-%m-%d").date()
-    except Exception:
-        return None
-
-def _fmt_br(d: date | None) -> str:
-    return d.strftime("%d/%m/%Y") if d else "-"
-
-def _format_consulta_line(line: str) -> str | None:
-    line = line.strip()
-    if not line.startswith("#"):
-        return None
-
-    m_head = re.match(r"#(?P<id>\d+)\s*[—-]\s*(?P<tipo>[A-Za-zÀ-ÿ]+)\s*(\((?P<extras>[^)]+)\))?", line)
-    if not m_head:
-        return None
-    rid   = m_head.group("id")
-    tipo  = (m_head.group("tipo") or "Consulta").capitalize()
-    extra = m_head.group("extras")
-
-    labels = []
-    for lab, dt in re.findall(r"(?i)\b(agendado|realizado|retorno)\s*:\s*([0-9]{4}-[0-9]{2}-[0-9]{2}|[0-9]{2}/[0-9]{2}/[0-9]{4})", line):
-        labels.append( (lab.lower(), dt) )
-
-    def to_br(d):
-        if re.match(r"^\d{4}-\d{2}-\d{2}$", d):
-            y, m, dd = d.split("-"); return f"{dd}/{m}/{y}"
-        return d
-
-    parts = [f"#{rid} — {tipo}"]
-    if extra:
-        parts[0] += f" ({extra})"
-
-    shown_any = False
-    for key in ["agendado", "realizado", "retorno"]:
-        for lab, d in labels:
-            if lab == key:
-                parts.append(f"{lab.capitalize()}: {to_br(d)}")
-                shown_any = True
-
-    if not shown_any:
-        m_real_old = re.search(r"(?i)\brealizado\s*:\s*([0-9]{4}-[0-9]{2}-[0-9]{2})", line)
-        m_ret_old  = re.search(r"(?i)\bretorno\s*:\s*([0-9]{4}-[0-9]{2}-[0-9]{2})", line)
-        if m_ret_old:
-            parts.append(f"Retorno: {to_br(m_ret_old.group(1))}")
-            shown_any = True
-        if m_real_old:
-            parts.append(f"Realizado: {to_br(m_real_old.group(1))}")
-            shown_any = True
-
-    return " | ".join(parts) if parts else None
-
-def render_health_if_possible(raw: str) -> bool:
-    triggers = ["Próximo compromisso", "Próximo retorno", "Último compromisso", "Últimos registros",
-                "Proximo compromisso", "Proximo retorno", "Ultimo compromisso", "Ultimos registros"]
-    if not any(t in raw for t in triggers):
-        return False
-
-    lines = [l for l in raw.splitlines() if l.strip()]
-    header = None
-    items = []
-
-    for i, l in enumerate(lines):
-        if any(l.startswith(t) for t in triggers):
-            header = l.strip().replace(":", "")
-            continue
-        fmt = _format_consulta_line(l)
-        if fmt:
-            items.append(fmt)
-
-    if not header and not items:
-        return False
-    if not header:
-        header = "Registros de saúde"
-
-    body = "<br>".join(items) if items else "—"
-    st.markdown(
-        "<div class='center-wrap'><div class='shadow-card' style='text-align:left'>"
-        f"<b>🩺 {header}</b><br><br>"
-        f"{body}"
-        "</div></div>",
-        unsafe_allow_html=True,
-    )
-    return True
 
 # =========================
 # LOGIN COM SENHA POR USUÁRIO
@@ -667,6 +449,30 @@ USERS_PASS_SHA256 = {
     "glauco":    "e4d8e2c97976e3e0ddeae407fd54987f0b4f8d6792284742b51399a078765319",
     "helena":    "4b9a7f50c0bb198c6f5414c5a8459f5d216d34ab521ea94c060ea35cac66f900",
 }
+
+# Permite criar/atualizar senha sem editar o código: salva hashes em um JSON local
+PASSWORDS_PATH = os.path.join(BASE_DIR, "user_passwords.json")
+
+def _load_password_overrides() -> dict:
+    if not os.path.exists(PASSWORDS_PATH):
+        return {}
+    try:
+        with open(PASSWORDS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return {str(k): str(v) for k, v in data.items() if isinstance(v, str)}
+    except Exception:
+        return {}
+
+def _save_password_overrides(overrides: dict) -> None:
+    try:
+        with open(PASSWORDS_PATH, "w", encoding="utf-8") as f:
+            json.dump(overrides, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+# aplica overrides (ex: primeiro acesso da Rayane)
+USERS_PASS_SHA256.update(_load_password_overrides())
+
 
 def _sha256_hex(s: str) -> str:
     return hashlib.sha256(s.encode()).hexdigest()
@@ -681,9 +487,38 @@ if not st.session_state.logged_in:
     with mid:
         who = st.selectbox("Usuário", list(USERS.keys()), format_func=lambda k: USERS[k]["label"])
         pwd = st.text_input("Senha", type="password")
+        # Primeiro acesso: se for um usuário novo (ex.: Rayane), você pode definir uma senha aqui.
+        # Dica: depois a gente pode migrar isso para um painel de configurações.
+        pending_user = st.session_state.get("_pending_user")
+        if pending_user:
+            st.info(f"Primeiro acesso de **{USERS.get(pending_user, {}).get('label', pending_user).title()}**: defina uma senha.")
+            new_pwd1 = st.text_input("Nova senha", type="password", key="new_pwd1")
+            new_pwd2 = st.text_input("Confirmar nova senha", type="password", key="new_pwd2")
+            cols_pwd = st.columns(2)
+            if cols_pwd[0].button("Salvar senha", use_container_width=True):
+                if not new_pwd1 or len(new_pwd1) < 4:
+                    st.error("Use uma senha com pelo menos 4 caracteres.")
+                elif new_pwd1 != new_pwd2:
+                    st.error("As senhas não conferem.")
+                else:
+                    overrides = _load_password_overrides()
+                    overrides[pending_user] = _sha256_hex(new_pwd1)
+                    _save_password_overrides(overrides)
+                    USERS_PASS_SHA256[pending_user] = overrides[pending_user]
+                    st.session_state.pop("_pending_user", None)
+                    st.session_state.pop("_pending_pwd", None)
+                    st.success("Senha salva! Agora é só entrar.")
+                    st.rerun()
+            if cols_pwd[1].button("Cancelar", use_container_width=True):
+                st.session_state.pop("_pending_user", None)
+                st.session_state.pop("_pending_pwd", None)
+                st.rerun()
         if st.button("Entrar", use_container_width=True):
+            # Se o usuário ainda não tem senha definida (ex.: Rayane), permitir criar no primeiro acesso
             if who not in USERS_PASS_SHA256:
-                st.error("Usuário inválido.")
+                st.session_state["_pending_user"] = who
+                st.session_state["_pending_pwd"] = pwd
+                st.rerun()
             elif _sha256_hex(pwd) != USERS_PASS_SHA256[who]:
                 st.error("Senha incorreta. Tente novamente.")
             else:
@@ -697,11 +532,6 @@ if not st.session_state.logged_in:
 # Sidebar — sem troca de usuário
 # =========================
 with st.sidebar:
-    api_ok = api_health_ok()
-    st.markdown(
-        f"<span class='pill {'ok' if api_ok else 'bad'}'>● API {'online' if api_ok else 'offline'}</span>",
-        unsafe_allow_html=True
-    )
 
     if st.button("➕ Novo chat", use_container_width=True):
         cid = str(uuid.uuid4())
@@ -735,12 +565,24 @@ with st.sidebar:
 
     st.caption(f"session_id: {st.session_state.session_id}")
 
-    if st.button("🩺 Testar API", use_container_width=True):
-        try:
-            r = requests.get(HEALTH_URL, timeout=5)
-            st.success("API ok" if r.ok else f"Erro: {r.status_code}")
-        except Exception as e:
-            st.error(f"Falha: {e}")
+    st.write("---")
+    st.subheader("📎 Upload")
+    up_file = st.file_uploader("Enviar arquivo (boletim, aviso, etc.)", type=None, label_visibility="collapsed")
+    up_desc = st.text_input("Descrição do arquivo (pra achar depois)", key="up_desc")
+    if st.button("Salvar upload", use_container_width=True, disabled=(up_file is None)):
+        if up_file is None:
+            st.warning("Selecione um arquivo primeiro.")
+        else:
+            resp = upload_to_backend(up_file.getvalue(), up_file.name, up_desc)
+            if resp.get("ok"):
+                st.success(f"Upload salvo! ID #{resp.get('upload_id')}", icon="✅")
+                # registra no chat atual como mensagem do sistema
+                get_current_chat()["messages"].append({"role":"assistant","content": f"📎 Upload salvo: #{resp.get('upload_id')} — {resp.get('original_name')}\nDescrição: {resp.get('description') or '—'}\nDica: 'Resumir arquivo #{resp.get('upload_id')}'"})
+                st.rerun()
+            else:
+                st.error(resp.get("error","Falha no upload."))
+
+
 
 # =========================
 # Header central (mantém como v8)
@@ -792,32 +634,463 @@ for msg in chat["messages"]:
     with st.chat_message(who, avatar=avatar):
         content = msg["content"]
         if who == "assistant":
-            # 1) consultas médicas primeiro
-            if render_health_if_possible(content):
-                continue
-            # 2) notas
+            # 1) notas (quando o backend devolver no formato conhecido)
             tbl = render_grades_table_if_possible(content)
             if tbl:
                 st.markdown("**Aqui estão suas notas organizadas:**")
                 st.markdown(tbl)
             else:
-                # 3) futebol (jogos/projeções)
-                if not try_render_football_pretty(content):
-                    # 4) formatação genérica para respostas cruas
-                    md = format_goomi_plaintext(content)
-                    if md:
-                        st.markdown(md)
-                    else:
-                        st.markdown(content)
+                # 2) formatação genérica para respostas cruas
+                md = format_goomi_plaintext(content)
+                if md:
+                    st.markdown(md)
+                else:
+                    st.markdown(content)
         else:
             st.markdown(content)
+
+
 
 # =========================
 # Entrada
 # =========================
 st.markdown("<div class='center-wrap'>", unsafe_allow_html=True)
-prompt = st.chat_input(f"Converse com o {APP_NAME}…")
+
+
+
+
+
+
+# ─────────────────────────────────────────────
+
+
+
+
+
+
+# Input row (texto + voz) — layout refinado
+
+
+
+
+
+
+# ─────────────────────────────────────────────
+
+
+
+
+
+
+st.markdown("""
+
+
+
+
+
+
+<style>
+
+
+
+
+
+
+/* Deixa o input e o mic na mesma linha */
+
+
+
+
+
+
+div[data-testid="stHorizontalBlock"]{ align-items: center !important; }
+
+
+
+
+
+
+
+
+
+
+
+
+
+/* Limpa o visual do audio_input (sem caixa) */
+
+
+
+
+
+
+div[data-testid="stAudioInput"]{ background: transparent !important; padding: 0 !important; margin: 0 !important; }
+
+
+
+
+
+
+div[data-testid="stAudioInput"] > div{ background: transparent !important; border: none !important; box-shadow: none !important; padding: 0 !important; }
+
+
+
+
+
+
+div[data-testid="stAudioInput"] label, div[data-testid="stAudioInput"] p{ display:none !important; height:0 !important; margin:0 !important; padding:0 !important; }
+
+
+
+
+
+
+div[data-testid="stAudioInput"] button{ width: 38px !important; height: 38px !important; border-radius: 999px !important; padding: 0 !important; }
+
+
+
+
+
+
+div[data-testid="stAudioInput"] span{ font-size: 11px !important; }
+
+
+
+
+
+
+</style>
+
+
+
+
+
+
+""", unsafe_allow_html=True)
+
+
+
+
+
+
+
+
+
+
+
+
+
+col_chat, col_mic = st.columns([0.88, 0.12], gap="small")
+
+
+
+
+
+
+with col_chat:
+
+
+
+
+
+
+    prompt = st.chat_input("Converse com o Goomih…")
+
+
+
+
+
+
+with col_mic:
+
+
+
+
+
+
+    voice = st.audio_input("", key="voice_row_v12")
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Auto-envia quando chega um áudio novo
+
+
+
+
+
+
+if "last_voice_hash" not in st.session_state:
+
+
+
+
+
+
+    st.session_state["last_voice_hash"] = ""
+
+
+
+
+
+
+
+
+
+
+
+
+
+if voice is not None:
+
+
+
+
+
+
+    audio_bytes = voice.getvalue()
+
+
+
+
+
+
+    if audio_bytes:
+
+
+
+
+
+
+        try:
+
+
+
+
+
+
+            import hashlib, tempfile
+
+
+
+
+
+
+            from openai import OpenAI
+
+
+
+
+
+
+
+
+
+
+
+
+
+            h = hashlib.md5(audio_bytes).hexdigest()
+
+
+
+
+
+
+            if h != st.session_state["last_voice_hash"]:
+
+
+
+
+
+
+                st.session_state["last_voice_hash"] = h
+
+
+
+
+
+
+
+
+
+
+
+
+
+                client = OpenAI()
+
+
+
+
+
+
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+
+
+
+
+
+
+                    tmp.write(audio_bytes)
+
+
+
+
+
+
+                    tmp_path = tmp.name
+
+
+
+
+
+
+
+
+
+
+
+
+
+                with open(tmp_path, "rb") as f:
+
+
+
+
+
+
+                    tr = client.audio.transcriptions.create(
+
+
+
+
+
+
+                        model="gpt-4o-mini-transcribe",
+
+
+
+
+
+
+                        file=f
+
+
+
+
+
+
+                    )
+
+
+
+
+
+
+
+
+
+
+
+
+
+                texto = (getattr(tr, "text", "") or "").strip()
+
+
+
+
+
+
+                if texto:
+
+
+
+
+
+
+                    get_current_chat()["messages"].append({"role":"user","content": f"(Áudio) {texto}"})
+
+
+
+
+
+
+                    with st.spinner("Perguntando ao Goomih…"):
+
+
+
+
+
+
+                        answer = ask_backend(texto)
+
+
+
+
+
+
+                    get_current_chat()["messages"].append({"role":"assistant","content": answer})
+
+
+
+
+
+
+                    _bump_quick_usage(st.session_state.client_id, texto)
+
+
+
+
+
+
+                    st.rerun()
+
+
+
+
+
+
+        except Exception:
+
+
+
+
+
+
+            try:
+
+
+
+
+
+
+                st.toast("Falha ao transcrever (verifique OPENAI_API_KEY).", icon="⚠️")
+
+
+
+
+
+
+            except Exception:
+
+
+
+
+
+
+                pass
 st.markdown("</div>", unsafe_allow_html=True)
+
 
 if prompt:
     chat["messages"].append({"role": "user", "content": prompt})
@@ -829,22 +1102,46 @@ if prompt:
 
     chat["messages"].append({"role": "assistant", "content": answer})
     with st.chat_message("assistant", avatar="🤖"):
-        # 1) consultas médicas primeiro
-        if not render_health_if_possible(answer):
-            # 2) notas
-            tbl = render_grades_table_if_possible(answer)
-            if tbl:
-                st.markdown("**Aqui estão suas notas organizadas:**")
-                st.markdown(tbl)
+        # 1) notas
+        tbl = render_grades_table_if_possible(answer)
+        if tbl:
+            st.markdown("**Aqui estão suas notas organizadas:**")
+            st.markdown(tbl)
+        else:
+            # 2) formatação genérica para respostas cruas
+            md = format_goomi_plaintext(answer)
+            if md:
+                st.markdown(md)
             else:
-                # 3) futebol (jogos/projeções)
-                if not try_render_football_pretty(answer):
-                    # 4) formatação genérica para respostas cruas
-                    md = format_goomi_plaintext(answer)
-                    if md:
-                        st.markdown(md)
-                    else:
-                        st.markdown(answer)
+                st.markdown(answer)
 
     _bump_quick_usage(st.session_state.client_id, prompt)
     st.rerun()
+
+# =========================
+# Auto-scroll (mantém a caixa de texto visível)
+# =========================
+# A âncora fica NO FIM DA PÁGINA (depois do input). Assim, ao rolar até o fim,
+# a última mensagem fica visível e a caixa de texto também.
+# Para não atrapalhar quando você estiver lendo mensagens antigas, só auto-rola
+# quando o tamanho do histórico muda.
+
+_current_len = len(get_current_chat()["messages"])
+_last_len = st.session_state.get("_last_chat_len", -1)
+
+st.markdown("<div id='page-bottom' style='height:1px;'></div>", unsafe_allow_html=True)
+
+if _current_len != _last_len:
+    st.session_state["_last_chat_len"] = _current_len
+    components.html(
+        """
+        <script>
+          const el = window.parent.document.getElementById('page-bottom');
+          if (el) {
+            // Pequeno atraso para garantir que o DOM já renderizou a última mensagem e o input
+            setTimeout(() => { el.scrollIntoView({behavior: 'smooth', block: 'end'}); }, 80);
+          }
+        </script>
+        """,
+        height=0,
+    )
